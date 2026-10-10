@@ -365,6 +365,16 @@ func TestShellKeyGatingAndRequest(t *testing.T) {
 	if _, ok := run.OpenShell(); ok {
 		t.Fatal("OpenShell must consume the request once")
 	}
+	// while a probe/shell is in flight, further "e" presses are ignored
+	run.Update(key("e"))
+	if _, ok := run.OpenShell(); ok {
+		t.Fatal("second e during shell must not re-arm")
+	}
+	run.Update(shellExitedMsg{msgTag: msgTag{hostID: "h", gen: 1}, name: "c1"})
+	run.Update(key("e"))
+	if _, ok := run.OpenShell(); !ok {
+		t.Fatal("e after shell exit must arm again")
+	}
 	exited := mkDash("exited")
 	exited.Update(key("e"))
 	if _, ok := exited.OpenShell(); ok {

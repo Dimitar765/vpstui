@@ -61,6 +61,7 @@ type Dashboard struct {
 	back          bool
 	logReq        *containerReq
 	shellReq      *containerReq
+	shellBusy     bool
 }
 
 var tableColumns = []table.Column{
@@ -253,6 +254,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		return d, nil
 
 	case shellExitedMsg:
+		d.shellBusy = false
 		if msg.err != nil {
 			detail := msg.detail
 			if detail == "" {
@@ -388,8 +390,12 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			}
 			return d, nil
 		case "e":
+			if d.shellBusy {
+				return d, nil // a probe or shell is already in flight
+			}
 			if c, ok := d.selected(); ok {
 				if c.State == "running" {
+					d.shellBusy = true
 					d.shellReq = &containerReq{id: c.ID, name: c.ShortName()}
 				} else {
 					d.toast = "shell needs a running container"

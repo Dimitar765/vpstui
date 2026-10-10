@@ -56,24 +56,14 @@ func (c *Conn) StartPty(ctx context.Context, cfg PtyConfig, in io.Reader, out io
 		return nil, fmt.Errorf("start command: %w", err)
 	}
 
+	// ssh.Session.Wait may be called exactly once (a single exit-status value
+	// is delivered to one caller), so this watcher must NOT wait on the
+	// session itself; it only force-closes the session when ctx is canceled.
 	go func() {
-		select {
-		case <-ctx.Done():
-			_ = sess.Close()
-		case <-doneChan(sess):
-		}
+		<-ctx.Done()
+		_ = sess.Close()
 	}()
 	return p, nil
-}
-
-// doneChan closes when the session exits so the ctx watcher can stop early.
-func doneChan(sess *ssh.Session) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		_ = sess.Wait()
-		close(done)
-	}()
-	return done
 }
 
 // WindowChange forwards a terminal resize; rows before cols.
