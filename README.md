@@ -13,6 +13,8 @@ VPS servers over SSH, written in Go.
 - **Dashboard** — live host metrics (load, memory, CPUs, uptime) and a
   container table (state, status, CPU %, MEM %) refreshed every 2s, all
   computed by running `docker ps` / `docker stats --no-stream` over SSH.
+  Columns adapt to the terminal width; running/exited/other states are
+  color-coded and high CPU/MEM readings highlight as they climb.
 - **Container actions** — start (`s`), stop (`x`), restart (`r`), remove (`D`,
   stopped containers only) with `y/N` confirmation. Containers are grouped by
   compose project (fold with `space`), details via `d`.
@@ -32,6 +34,8 @@ go build -o vpstui .
 ```
 
 Keys are shown in the help bar of each screen; `ctrl+c` quits from anywhere.
+Vim-style navigation works throughout: `j`/`k` move rows or scroll, `g`/`G`
+jump to top/bottom, and help bars are pinned to the last terminal row.
 
 ## Secret storage
 
