@@ -646,7 +646,7 @@ func (d *Dashboard) View() string {
 			inner.WriteString(d.detail.text)
 		}
 		b.WriteString(panel(styleTitle.Render("detail — "+d.detail.name), inner.String(), d.width) + "\n")
-		return pinFooter(b.String(), helpLine("esc", "close", "d", "close", "f", "refresh"), d.height)
+		return pinFooter(b.String(), helpLine("esc", "close", "d", "close", "f", "refresh"), d.width, d.height)
 	}
 	if d.showDisk {
 		var inner strings.Builder
@@ -663,7 +663,7 @@ func (d *Dashboard) View() string {
 			}
 		}
 		b.WriteString(panel(styleTitle.Render("disk usage"), inner.String(), d.width) + "\n")
-		return pinFooter(b.String(), helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close"), d.height)
+		return pinFooter(b.String(), helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close"), d.width, d.height)
 	}
 	if len(d.containers) == 0 && d.errMsg == "" && !d.disconnected {
 		b.WriteString(styleMuted.Render("no containers found on this host") + "\n")
@@ -675,5 +675,5 @@ func (d *Dashboard) View() string {
 	} else {
 		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back")
 	}
-	return pinFooter(b.String(), footer, d.height)
+	return pinFooter(b.String(), footer, d.width, d.height)
 }

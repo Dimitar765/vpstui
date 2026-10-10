@@ -137,5 +137,5 @@ func (c *ContainerView) View() string {
 		status = styleOK.Render("● streaming…")
 	}
 	body := panel(title, status+"\n"+c.vp.View(), c.width-2)
-	return pinFooter(body, helpLine("↑/↓ j/k", "scroll", "pgup/pgdn", "page", "g/G", "top/bottom", "esc", "back"), c.height)
+	return pinFooter(body, helpLine("↑/↓ j/k", "scroll", "pgup/pgdn", "page", "g/G", "top/bottom", "esc", "back"), c.width, c.height)
 }

@@ -8,7 +8,7 @@ import (
 )
 
 func TestPinFooter(t *testing.T) {
-	got := pinFooter("a\nb", "f", 5)
+	got := pinFooter("a\nb", "f", 40, 5)
 	if want := "a\nb\n\n\nf"; got != want {
 		t.Errorf("pinFooter short body:\n got %q\nwant %q", got, want)
 	}
@@ -16,13 +16,26 @@ func TestPinFooter(t *testing.T) {
 		t.Errorf("height = %d, want 5", h)
 	}
 	// body taller than frame: footer follows immediately, no negative gap
-	got = pinFooter("a\nb\nc\nd", "f", 3)
+	got = pinFooter("a\nb\nc\nd", "f", 40, 3)
 	if !strings.HasSuffix(got, "\nf") || strings.Contains(got, "\n\nf") {
 		t.Errorf("overflow case wrong: %q", got)
 	}
 	// empty footer returns body untouched
-	if got := pinFooter("x\n", "", 10); got != "x" {
+	if got := pinFooter("x\n", "", 40, 10); got != "x" {
 		t.Errorf("empty footer = %q, want %q", got, "x")
+	}
+}
+
+func TestPinFooterWrapsWideFooter(t *testing.T) {
+	footer := helpLine("aaaa", "bb", "cccc", "dd", "eeee", "ff", "gggg", "hh")
+	got := pinFooter("body", footer, 20, 8)
+	if lipgloss.Height(got) != 8 {
+		t.Errorf("height = %d, want 8", lipgloss.Height(got))
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if lipgloss.Width(line) > 20 {
+			t.Errorf("wrapped line too wide (%d): %q", lipgloss.Width(line), line)
+		}
 	}
 }
 

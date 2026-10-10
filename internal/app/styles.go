@@ -26,6 +26,8 @@ var (
 // stays within ctable's State column width for all docker states.
 func stateCell(state string) string {
 	switch state {
+	case "":
+		return ""
 	case "running":
 		return styleOK.Render("● " + state)
 	case "exited":
@@ -57,7 +59,7 @@ func lipglossActiveTab() lipgloss.Style {
 func helpLine(pairs ...string) string {
 	var b []string
 	for i := 0; i+1 < len(pairs); i += 2 {
-		b = append(b, styleKey.Render(pairs[i])+" "+styleMuted.Render(pairs[i+1]))
+		b = append(b, styleKey.Render(pairs[i])+" "+styleMuted.Render(pairs[i+1])+"  ")
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, b...)
 }
@@ -80,15 +82,50 @@ func panel(title, content string, width int) string {
 
 // pinFooter places body at the top of a height-row frame and footer on its
 // last row. If the body is taller than the frame the footer simply follows.
-func pinFooter(body, footer string, height int) string {
+func pinFooter(body, footer string, width, height int) string {
 	body = strings.TrimRight(body, "\n")
 	footer = strings.TrimRight(footer, "\n")
 	if footer == "" {
 		return body
+	}
+	if width > 0 {
+		var wrapped []string
+		for _, line := range strings.Split(footer, "\n") {
+			wrapped = append(wrapped, wrapSegments(line, width)...)
+		}
+		footer = strings.Join(wrapped, "\n")
 	}
 	gap := height - lipgloss.Height(body) - lipgloss.Height(footer)
 	if gap < 0 {
 		gap = 0
 	}
 	return body + strings.Repeat("\n", gap+1) + footer
+}
+
+// wrapSegments folds a line made of "  "-separated styled segments onto
+// itself. runewidth is not ANSI-aware, so grouping happens per segment
+// using lipgloss.Width, keeping escape sequences intact.
+func wrapSegments(line string, width int) []string {
+	segs := strings.Split(line, "  ")
+	var lines []string
+	cur := ""
+	for _, s := range segs {
+		if s == "" {
+			continue
+		}
+		if cur != "" && lipgloss.Width(cur)+2+lipgloss.Width(s) > width {
+			lines = append(lines, cur)
+			cur = s
+			continue
+		}
+		if cur == "" {
+			cur = s
+			continue
+		}
+		cur += "  " + s
+	}
+	if cur != "" || lines == nil {
+		lines = append(lines, cur)
+	}
+	return lines
 }

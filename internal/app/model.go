@@ -604,9 +604,9 @@ func (m *Model) View() string {
 			body += "\n" + styleWarn.Render(m.status)
 			m.status = ""
 		}
-		return pinFooter(body, helpLine("↑/↓ j/k", "move", "n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.height)
+		return pinFooter(body, helpLine("↑/↓ j/k", "move", "n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.width, m.height)
 	case viewForm, viewPrompt:
-		return pinFooter(m.form.View(m.width), m.form.Help(), m.height)
+		return pinFooter(m.form.View(m.width), m.form.Help(), m.width, m.height)
 	case viewConnecting:
 		inner := m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…\n" +
 			styleMuted.Render("esc: keep dialing in background")

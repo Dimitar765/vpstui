@@ -27,6 +27,7 @@ func TestStateCell(t *testing.T) {
 		{"exited", "\x1b[38;5;241m", "○ exited"},
 		{"restarting", "\x1b[38;5;214m", "● restarting"},
 		{"dead", "\x1b[38;5;214m", "● dead"},
+		{"", "", ""},
 	}
 	for _, tc := range cases {
 		got := stateCell(tc.state)
