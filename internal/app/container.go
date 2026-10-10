@@ -14,6 +14,8 @@ import (
 
 type ContainerView struct {
 	id, name string
+	hostID   string
+	gen      uint64
 	vp       viewport.Model
 	buf      strings.Builder
 	err      string
@@ -53,7 +55,11 @@ func (c *ContainerView) Stop() {
 	c.running = false
 }
 
-func streamLogs(r io.ReadCloser, send func(tea.Msg)) {
+func (c *ContainerView) tag(hostID string, gen uint64) bool {
+	return c.hostID == hostID && c.gen == gen
+}
+
+func streamLogs(r io.ReadCloser, send func(tea.Msg), t msgTag) {
 	defer r.Close()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -61,14 +67,14 @@ func streamLogs(r io.ReadCloser, send func(tea.Msg)) {
 		if send == nil {
 			return
 		}
-		send(logChunkMsg{chunk: sc.Text() + "\n"})
+		send(logChunkMsg{msgTag: t, chunk: sc.Text() + "\n"})
 	}
 	err := sc.Err()
 	if send != nil {
 		if err != nil && !strings.Contains(err.Error(), "file already closed") {
-			send(logEndMsg{err: err})
+			send(logEndMsg{msgTag: t, err: err})
 		} else {
-			send(logEndMsg{})
+			send(logEndMsg{msgTag: t})
 		}
 	}
 }

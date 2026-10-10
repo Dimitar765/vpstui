@@ -22,6 +22,9 @@ type Dashboard struct {
 	host models.Host
 	dock *docker.Executor
 
+	hostID string
+	gen    uint64
+
 	tbl          table.Model
 	containers   []models.Container
 	stats        map[string]models.ContainerStats // by container name
@@ -50,11 +53,15 @@ var tableColumns = []table.Column{
 	{Title: "MEM USAGE", Width: 18},
 }
 
-func NewDashboard(host models.Host, dock *docker.Executor, w, h int) *Dashboard {
-	d := &Dashboard{host: host, dock: dock, stats: map[string]models.ContainerStats{}, width: w, height: h}
+func NewDashboard(host models.Host, dock *docker.Executor, w, h int, gen uint64) *Dashboard {
+	d := &Dashboard{host: host, dock: dock, hostID: host.ID, gen: gen, stats: map[string]models.ContainerStats{}, width: w, height: h}
 	t := table.New(table.WithColumns(tableColumns), table.WithWidth(max(w-2, 20)))
 	d.tbl = t
 	return d
+}
+
+func (d *Dashboard) tag(hostID string, gen uint64) bool {
+	return d.hostID == hostID && d.gen == gen
 }
 
 func (d *Dashboard) SetSize(w, h int) {
@@ -90,16 +97,17 @@ func (d *Dashboard) selected() (models.Container, bool) {
 
 func (d *Dashboard) fetchNow() tea.Cmd {
 	dock := d.dock
+	t := msgTag{hostID: d.hostID, gen: d.gen}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
 		containers, err := dock.ListContainers(ctx)
 		if err != nil {
-			return statsLoadedMsg{err: err}
+			return statsLoadedMsg{msgTag: t, err: err}
 		}
 		cstats, _ := dock.ContainerStats(ctx)
 		hstats, herr := dock.HostStats(ctx)
-		return statsLoadedMsg{containers: containers, cstats: cstats, hstats: hstats, err: herr}
+		return statsLoadedMsg{msgTag: t, containers: containers, listOK: true, cstats: cstats, hstats: hstats, err: herr}
 	}
 }
 
@@ -109,7 +117,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		return d, nil // root re-schedules the fetch chain
 
 	case statsLoadedMsg:
-		if msg.err != nil && msg.containers == nil {
+		if !msg.listOK {
 			d.errMsg = msg.err.Error()
 			if looksLikeConnLoss(msg.err.Error()) {
 				d.disconnected = true
@@ -123,7 +131,11 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		}
 		d.hstats = msg.hstats
 		d.hasHostStats = true
-		d.errMsg = ""
+		if msg.err != nil {
+			d.errMsg = "host stats unavailable: " + msg.err.Error()
+		} else {
+			d.errMsg = ""
+		}
 		d.disconnected = false
 		d.rebuild()
 		return d, nil
@@ -150,6 +162,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 					return d, nil
 				}
 				dock := d.dock
+				t := msgTag{hostID: d.hostID, gen: d.gen}
 				return d, func() tea.Msg {
 					ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 					defer cancel()
@@ -162,7 +175,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 					case "restart":
 						err = dock.Restart(ctx, c.ID)
 					}
-					return actionDoneMsg{verb: verb, name: c.ShortName(), err: err}
+					return actionDoneMsg{msgTag: t, verb: verb, name: c.ShortName(), err: err}
 				}
 			case "n", "N", "esc":
 				d.confirm = ""

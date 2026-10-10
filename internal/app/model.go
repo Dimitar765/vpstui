@@ -28,11 +28,17 @@ const (
 )
 
 // internal messages
+type msgTag struct {
+	hostID string
+	gen    uint64
+}
+
 type connectHostReq struct{ host models.Host }
 type newHostReq struct{}
 type editHostReq struct{ host models.Host }
 type deleteHostReq struct{ host models.Host }
 type connectDoneMsg struct {
+	msgTag
 	conn *sshclient.Conn
 	err  error
 	host models.Host
@@ -42,20 +48,29 @@ type formSubmittedMsg struct {
 	secretV string
 	isNew   bool
 }
-type statsTickMsg struct{}
+type statsTickMsg struct{ msgTag }
 type statsLoadedMsg struct {
+	msgTag
 	containers []models.Container
+	listOK     bool // containers fetched successfully (possibly empty)
 	cstats     []models.ContainerStats
 	hstats     models.HostStats
 	err        error
 }
 type actionDoneMsg struct {
+	msgTag
 	verb string
 	name string
 	err  error
 }
-type logChunkMsg struct{ chunk string }
-type logEndMsg struct{ err error }
+type logChunkMsg struct {
+	msgTag
+	chunk string
+}
+type logEndMsg struct {
+	msgTag
+	err error
+}
 
 type Model struct {
 	hosts []models.Host
@@ -71,6 +86,8 @@ type Model struct {
 	sp spinner.Model
 
 	pendingHost models.Host
+	pendingGen  uint64
+	genSeq      uint64
 
 	conn *sshclient.Conn
 	dock *docker.Executor
@@ -226,6 +243,8 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if req, ok := m.dash.OpenLogs(); ok {
 			m.cv = NewContainerView(req.id, req.name, m.width, m.height)
+			m.cv.hostID = m.dash.hostID
+			m.cv.gen = m.dash.gen
 			m.view = viewContainer
 			return m, m.startLogStream(m.cv, req.id)
 		}
@@ -237,7 +256,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cv.Stop()
 			m.cv = nil
 			m.view = viewDashboard
-			return m, m.dash.fetchNow()
+			return m, tea.Batch(m.dash.fetchNow(), tickStats(m.dash.hostID, m.dash.gen))
 		}
 		var cmd tea.Cmd
 		m.cv, cmd = m.cv.Update(msg)
@@ -247,27 +266,37 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch m.view {
-	case viewDashboard:
-		if _, isTick := msg.(statsTickMsg); isTick {
+	switch msg := msg.(type) {
+	case statsTickMsg:
+		if m.view == viewDashboard && m.dash.tag(msg.hostID, msg.gen) {
 			m.dash, _ = m.dash.Update(msg)
-			return m, tea.Batch(m.dash.fetchNow(), tickStats())
+			return m, tea.Batch(m.dash.fetchNow(), tickStats(msg.hostID, msg.gen))
 		}
-		dash, cmd := m.dash.Update(msg)
-		m.dash = dash
-		return m, cmd
-	case viewContainer:
-		var cmd tea.Cmd
-		if chunk, ok := msg.(logChunkMsg); ok {
-			m.cv.Append(chunk.chunk)
-			return m, nil
+		return m, nil
+	case statsLoadedMsg:
+		if m.view == viewDashboard && m.dash.tag(msg.hostID, msg.gen) {
+			dash, cmd := m.dash.Update(msg)
+			m.dash = dash
+			return m, cmd
 		}
-		if end, ok := msg.(logEndMsg); ok {
-			m.cv.StreamDone(end.err)
-			return m, nil
+		return m, nil
+	case actionDoneMsg:
+		if m.view == viewDashboard && m.dash.tag(msg.hostID, msg.gen) {
+			dash, cmd := m.dash.Update(msg)
+			m.dash = dash
+			return m, cmd
 		}
-		m.cv, cmd = m.cv.Update(msg)
-		return m, cmd
+		return m, nil
+	case logChunkMsg:
+		if m.view == viewContainer && m.cv.tag(msg.hostID, msg.gen) {
+			m.cv.Append(msg.chunk)
+		}
+		return m, nil
+	case logEndMsg:
+		if m.view == viewContainer && m.cv.tag(msg.hostID, msg.gen) {
+			m.cv.StreamDone(msg.err)
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -368,8 +397,14 @@ func (m *Model) saveHost(msg formSubmittedMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) nextGen() uint64 {
+	m.genSeq++
+	return m.genSeq
+}
+
 func (m *Model) startConnect(h models.Host) (tea.Model, tea.Cmd) {
 	m.pendingHost = h
+	m.pendingGen = m.nextGen()
 	switch h.AuthType {
 	case models.AuthAgent:
 		return m.connectWithSecret(h, "")
@@ -396,14 +431,16 @@ func (m *Model) openPrompt(h models.Host, label string) (tea.Model, tea.Cmd) {
 func (m *Model) connectWithSecret(h models.Host, s string) (tea.Model, tea.Cmd) {
 	m.pendingHost = h
 	m.view = viewConnecting
+	gen := m.pendingGen
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	return m, func() tea.Msg {
 		defer cancel()
+		t := msgTag{hostID: h.ID, gen: gen}
 		conn, err := sshclient.Dial(ctx, h, s)
 		if err != nil {
-			return connectDoneMsg{err: err, host: h}
+			return connectDoneMsg{msgTag: t, err: err, host: h}
 		}
-		return connectDoneMsg{conn: conn, host: h}
+		return connectDoneMsg{msgTag: t, conn: conn, host: h}
 	}
 }
 
@@ -415,6 +452,9 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if msg.err != nil {
+		if msg.gen != m.pendingGen {
+			return m, nil
+		}
 		m.conn = nil
 		m.view = viewHosts
 		es := msg.err.Error()
@@ -427,30 +467,37 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 		m.status = "connect failed: " + es
 		return m, nil
 	}
+	if msg.gen != m.pendingGen {
+		msg.conn.Close()
+		return m, nil
+	}
 	m.conn = msg.conn
 	m.dock = docker.New(msg.conn)
-	m.dash = NewDashboard(msg.host, m.dock, m.width, m.height)
+	m.dash = NewDashboard(msg.host, m.dock, m.width, m.height, msg.gen)
 	m.view = viewDashboard
-	return m, tea.Batch(m.dash.fetchNow(), tickStats())
+	return m, tea.Batch(m.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
 }
 
 func (m *Model) startLogStream(cv *ContainerView, id string) tea.Cmd {
 	dock := m.dock
 	send := m.send
+	t := msgTag{hostID: cv.hostID, gen: cv.gen}
 	return func() tea.Msg {
 		r, err := cv.Open(dock, id)
 		if err != nil {
-			return logEndMsg{err: err}
+			return logEndMsg{msgTag: t, err: err}
 		}
 		go func() {
-			streamLogs(r, send)
+			streamLogs(r, send, t)
 		}()
 		return nil
 	}
 }
 
-func tickStats() tea.Cmd {
-	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return statsTickMsg{} })
+func tickStats(hostID string, gen uint64) tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+		return statsTickMsg{msgTag: msgTag{hostID: hostID, gen: gen}}
+	})
 }
 
 func fmtDuration(sec float64) string {
