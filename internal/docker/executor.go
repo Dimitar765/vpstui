@@ -124,6 +124,12 @@ func (e *Executor) HostStats(ctx context.Context) (models.HostStats, error) {
 	if err != nil {
 		return models.HostStats{}, err
 	}
+	return parseHostStats(out), nil
+}
+
+// parseHostStats parses the stdout produced by the HostStats probe command.
+// Extracted from HostStats without behavior change to make it testable.
+func parseHostStats(out string) models.HostStats {
 	var hs models.HostStats
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
@@ -148,7 +154,7 @@ func (e *Executor) HostStats(ctx context.Context) (models.HostStats, error) {
 			}
 		}
 	}
-	return hs, nil
+	return hs
 }
 
 func kbMB(s string) int {
