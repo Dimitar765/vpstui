@@ -647,18 +647,18 @@ func (m *Model) tabBar() string {
 	}
 	var parts []string
 	for i, s := range m.sessions {
-		mark := "○"
+		dot := "○"
 		if s.conn != nil {
-			mark = "●"
+			dot = "●"
 		}
-		label := fmt.Sprintf("%d %s %s", i+1, s.host.Name, mark)
+		label := fmt.Sprintf("%d %s %s", i+1, s.host.Name, dot)
 		if i == m.active {
 			parts = append(parts, lipglossActiveTab().Render(label))
 		} else {
 			parts = append(parts, styleMuted.Render(label))
 		}
 	}
-	return strings.Join(parts, "  ")
+	return strings.Join(parts, styleMuted.Render(" │ "))
 }
 
 func (m *Model) cleanup() {

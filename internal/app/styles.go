@@ -19,6 +19,7 @@ var (
 	styleTableHeader   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("241"))
 	styleTableSelected = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("236")).Foreground(lipgloss.Color("231"))
 	styleComposeHeader = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("147"))
+	styleAuth          = lipgloss.NewStyle().Foreground(lipgloss.Color("110"))
 )
 
 // stateCell renders a container state with a colored status dot. The result
@@ -50,7 +51,7 @@ func pctCell(s string) string {
 }
 
 func lipglossActiveTab() lipgloss.Style {
-	return lipgloss.NewStyle().Bold(true).Reverse(true).Padding(0, 1)
+	return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("236")).Foreground(lipgloss.Color("231")).Padding(0, 1)
 }
 
 func helpLine(pairs ...string) string {

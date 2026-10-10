@@ -19,13 +19,15 @@ func (i hostItem) Title() string {
 	if t == "" {
 		t = i.h.Address
 	}
+	t = styleKey.Render(t)
 	if i.conn {
 		t = styleOK.Render("●") + " " + t
 	}
 	return t
 }
 func (i hostItem) Description() string {
-	return fmt.Sprintf("%s@%s:%d · %s", i.h.User, i.h.Address, i.h.Port, i.h.AuthType)
+	return styleMuted.Render(fmt.Sprintf("%s@%s:%d", i.h.User, i.h.Address, i.h.Port)) +
+		styleMuted.Render(" · ") + styleAuth.Render(i.h.AuthType)
 }
 func (i hostItem) FilterValue() string { return i.Title() }
 
