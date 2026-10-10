@@ -88,17 +88,17 @@ func (t ctable) Update(msg tea.Msg) (ctable, tea.Cmd) {
 		return t, nil
 	}
 	switch km.String() {
-	case "up":
+	case "up", "k":
 		t.SetCursor(t.cursor - 1)
-	case "down":
+	case "down", "j":
 		t.SetCursor(t.cursor + 1)
 	case "pgup":
 		t.SetCursor(t.cursor - t.height)
 	case "pgdown":
 		t.SetCursor(t.cursor + t.height)
-	case "home":
+	case "home", "g":
 		t.SetCursor(0)
-	case "end":
+	case "end", "G":
 		t.SetCursor(len(t.rows) - 1)
 	default:
 		return t, nil

@@ -110,6 +110,16 @@ func (c *ContainerView) SetSize(w, h int) {
 }
 
 func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
+	if km, ok := msg.(tea.KeyMsg); ok {
+		switch km.String() {
+		case "g":
+			c.vp.GotoTop()
+			return c, nil
+		case "G":
+			c.vp.GotoBottom()
+			return c, nil
+		}
+	}
 	var cmd tea.Cmd
 	c.vp, cmd = c.vp.Update(msg)
 	return c, cmd
@@ -127,5 +137,5 @@ func (c *ContainerView) View() string {
 		status = styleOK.Render("● streaming…")
 	}
 	body := panel(title, status+"\n"+c.vp.View(), c.width-2)
-	return pinFooter(body, helpLine("↑/↓", "scroll", "pgup/pgdn", "page", "esc", "back"), c.height)
+	return pinFooter(body, helpLine("↑/↓ j/k", "scroll", "pgup/pgdn", "page", "g/G", "top/bottom", "esc", "back"), c.height)
 }

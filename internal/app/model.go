@@ -604,7 +604,7 @@ func (m *Model) View() string {
 			body += "\n" + styleWarn.Render(m.status)
 			m.status = ""
 		}
-		return pinFooter(body, helpLine("n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.height)
+		return pinFooter(body, helpLine("↑/↓ j/k", "move", "n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.height)
 	case viewForm, viewPrompt:
 		return pinFooter(m.form.View(m.width), m.form.Help(), m.height)
 	case viewConnecting:

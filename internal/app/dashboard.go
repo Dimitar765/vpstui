@@ -673,7 +673,7 @@ func (d *Dashboard) View() string {
 	if d.disconnected {
 		footer = helpLine("c", "reconnect", "esc", "back")
 	} else {
-		footer = helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back")
+		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back")
 	}
 	return pinFooter(b.String(), footer, d.height)
 }

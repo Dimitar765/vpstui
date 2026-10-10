@@ -169,3 +169,45 @@ func TestCTableEmpty(t *testing.T) {
 		t.Fatal("empty table should render nothing")
 	}
 }
+
+func TestCTableVimKeys(t *testing.T) {
+	tt := newTestTable(10)
+	key := func(r string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r)}
+	}
+	j, _ := tt.Update(key("j"))
+	if j.Cursor() != 1 {
+		t.Fatalf("j: cursor=%d want 1", j.Cursor())
+	}
+	k, _ := j.Update(key("k"))
+	if k.Cursor() != 0 {
+		t.Fatalf("k: cursor=%d want 0", k.Cursor())
+	}
+	G, _ := k.Update(key("G"))
+	if G.Cursor() != 9 {
+		t.Fatalf("G: cursor=%d want 9", G.Cursor())
+	}
+	g, _ := G.Update(key("g"))
+	if g.Cursor() != 0 {
+		t.Fatalf("g: cursor=%d want 0", g.Cursor())
+	}
+}
+
+func TestLogsViewTopBottom(t *testing.T) {
+	c := NewContainerView("abcdef0123456789", "web", 80, 30)
+	for i := 0; i < 100; i++ {
+		c.Append("line\n")
+	}
+	c.running = false // stop auto-follow so we can scroll
+	key := func(r string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r)}
+	}
+	c, _ = c.Update(key("g"))
+	if !c.vp.AtTop() {
+		t.Fatal("g should scroll logs to top")
+	}
+	c, _ = c.Update(key("G"))
+	if !c.vp.AtBottom() {
+		t.Fatal("G should scroll logs to bottom")
+	}
+}
