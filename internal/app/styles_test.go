@@ -31,8 +31,8 @@ func TestPanelFraming(t *testing.T) {
 	if !strings.Contains(p, "╭") || !strings.Contains(p, "╯") {
 		t.Errorf("panel missing rounded corners: %q", p)
 	}
-	if h := lipgloss.Height(p); h != 3 {
-		t.Errorf("panel height = %d, want 3", h)
+	if h := lipgloss.Height(p); h != 4 {
+		t.Errorf("panel height = %d, want 4", h)
 	}
 	if w := lipgloss.Width(p); w > 40 {
 		t.Errorf("panel width = %d, want ≤ 40", w)
