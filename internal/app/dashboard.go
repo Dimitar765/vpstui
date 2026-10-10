@@ -33,6 +33,7 @@ type Dashboard struct {
 	toastIsErr   bool
 	confirm      string // verb pending confirmation: start/stop/restart
 	disconnected bool
+	reconnect    bool
 
 	width, height int
 	back          bool
@@ -63,6 +64,12 @@ func (d *Dashboard) SetSize(w, h int) {
 }
 
 func (d *Dashboard) GoBack() bool { return d.back }
+
+func (d *Dashboard) TakeReconnect() bool {
+	r := d.reconnect
+	d.reconnect = false
+	return r
+}
 
 func (d *Dashboard) OpenLogs() (containerReq, bool) {
 	if d.logReq == nil {
@@ -117,6 +124,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		d.hstats = msg.hstats
 		d.hasHostStats = true
 		d.errMsg = ""
+		d.disconnected = false
 		d.rebuild()
 		return d, nil
 
@@ -164,6 +172,11 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			}
 		}
 		switch msg.String() {
+		case "c":
+			if d.disconnected {
+				d.reconnect = true
+			}
+			return d, nil
 		case "esc", "q":
 			d.back = true
 			return d, nil
@@ -232,7 +245,7 @@ func (d *Dashboard) View() string {
 			fmtDuration(hs.UptimeSec))) + "\n")
 	}
 	if d.disconnected {
-		b.WriteString(styleErr.Render("connection lost — press esc to go back") + "\n")
+		b.WriteString(styleErr.Render("connection lost — press c to reconnect, esc to go back") + "\n")
 	}
 	if d.confirm != "" {
 		if c, ok := d.selected(); ok {
@@ -254,6 +267,10 @@ func (d *Dashboard) View() string {
 		b.WriteString(styleMuted.Render("no containers found on this host") + "\n")
 	}
 	b.WriteString(d.tbl.View() + "\n")
-	b.WriteString(helpLine("enter", "logs", "s", "start", "x", "stop", "r", "restart", "f", "refresh", "esc", "back") + "\n")
+	if d.disconnected {
+		b.WriteString(helpLine("c", "reconnect", "esc", "back") + "\n")
+	} else {
+		b.WriteString(helpLine("enter", "logs", "s", "start", "x", "stop", "r", "restart", "f", "refresh", "esc", "back") + "\n")
+	}
 	return b.String()
 }

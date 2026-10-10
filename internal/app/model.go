@@ -206,6 +206,15 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case viewDashboard:
 		dash, cmd := m.dash.Update(msg)
 		m.dash = dash
+		if m.dash.TakeReconnect() {
+			h := m.dash.host
+			m.conn.Close()
+			m.conn = nil
+			m.dock = nil
+			m.dash = nil
+			m.cv = nil
+			return m.startConnect(h)
+		}
 		if m.dash.GoBack() {
 			m.conn.Close()
 			m.conn = nil
