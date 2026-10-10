@@ -13,8 +13,14 @@ VPS servers over SSH, written in Go.
 - **Dashboard** — live host metrics (load, memory, CPUs, uptime) and a
   container table (state, status, CPU %, MEM %) refreshed every 2s, all
   computed by running `docker ps` / `docker stats --no-stream` over SSH.
-- **Container actions** — start (`s`), stop (`x`), restart (`r`) with `y/N`
-  confirmation.
+- **Container actions** — start (`s`), stop (`x`), restart (`r`), remove (`D`,
+  stopped containers only) with `y/N` confirmation. Containers are grouped by
+  compose project (fold with `space`), details via `d`.
+- **Interactive shell** — `e` on a running container suspends the UI and
+  opens a shell inside it (`docker exec -i -t`, bash with `/bin/sh`
+  fallback) over the same SSH connection; `exit` resumes the dashboard.
+- **Disk panel** — `i` shows `docker system df`; `p`/`P` prune images/system
+  after confirmation.
 - **Log streaming** — follow `docker logs -f` in a scrollable viewport
   (`enter` from the dashboard, `esc` to stop).
 
