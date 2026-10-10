@@ -77,6 +77,12 @@ type detailLoadedMsg struct {
 	err    error
 }
 
+type diskLoadedMsg struct {
+	msgTag
+	objs []models.DiskObject
+	err  error
+}
+
 // Session is one live (or dialing) connection to a host. Only the active
 // session's dashboard ticks; background sessions pause but keep buffering
 // log chunks.
@@ -219,7 +225,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, detailLoadedMsg:
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, detailLoadedMsg, diskLoadedMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -455,6 +461,8 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case detailLoadedMsg:
 		t = msg.msgTag
+	case diskLoadedMsg:
+		t = msg.msgTag
 	}
 	s := m.findSession(t.hostID, t.gen)
 	if s == nil {
@@ -474,9 +482,13 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case actionDoneMsg:
 		if s.dash != nil {
-			s.dash, _ = s.dash.Update(msg)
+			var cmd tea.Cmd
+			s.dash, cmd = s.dash.Update(msg)
 			if m.view == viewDashboard && m.activeSession() == s {
-				return m, s.dash.fetchNow()
+				if cmd == nil {
+					cmd = s.dash.fetchNow()
+				}
+				return m, cmd
 			}
 		}
 		return m, nil
@@ -490,7 +502,7 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.cv.StreamDone(msg.err)
 		}
 		return m, nil
-	case detailLoadedMsg:
+	case detailLoadedMsg, diskLoadedMsg:
 		if s.dash != nil {
 			s.dash, _ = s.dash.Update(msg)
 		}

@@ -300,3 +300,32 @@ func TestParseInspectMalformed(t *testing.T) {
 		}
 	}
 }
+
+func TestParseDF(t *testing.T) {
+	const sample = `{"Type":"Images","TotalCount":"7","Active":"4","Size":"2.5GB","Reclaimable":"500MB (20%)"}` + "\n" +
+		`{"Type":"Containers","TotalCount":"9","Active":"6","Size":"150MB","Reclaimable":"30MB (20%)"}` + "\n" +
+		`{"Type":"Local Volumes","TotalCount":"3","Active":"2","Size":"1.1GB","Reclaimable":"0B (0%)"}` + "\n" +
+		`{"Type":"Build Cache","TotalCount":"12","Active":"0","Size":"4.2GB","Reclaimable":"4.2GB"}` + "\n"
+	got := parseDF(sample)
+	if len(got) != 4 {
+		t.Fatalf("rows=%d, want 4", len(got))
+	}
+	want := models.DiskObject{Type: "Images", Total: "7", Active: "4", Size: "2.5GB", Reclaimable: "500MB (20%)"}
+	if got[0] != want {
+		t.Errorf("row 0 = %+v, want %+v", got[0], want)
+	}
+	if got[3].Type != "Build Cache" || got[3].Reclaimable != "4.2GB" {
+		t.Errorf("row 3 = %+v", got[3])
+	}
+}
+
+func TestParseDFMalformed(t *testing.T) {
+	in := "not json\n{\"Type\":\"Images\",\"Total\":\"1\"}\ngarbage\n\n"
+	got := parseDF(in)
+	if len(got) != 1 || got[0].Type != "Images" || got[0].Active != "" {
+		t.Errorf("parseDF kept bad rows: %+v", got)
+	}
+	if res := parseDF(""); res != nil {
+		t.Errorf("parseDF(\"\") = %+v, want nil", res)
+	}
+}

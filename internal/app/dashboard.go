@@ -45,6 +45,11 @@ type Dashboard struct {
 
 	detail *detailState
 
+	showDisk    bool
+	diskLoading bool
+	diskErr     string
+	disk        []models.DiskObject
+
 	errMsg       string
 	toast        string
 	toastIsErr   bool
@@ -144,6 +149,17 @@ func (d *Dashboard) fetchNow() tea.Cmd {
 	}
 }
 
+func (d *Dashboard) fetchDisk() tea.Cmd {
+	dock := d.dock
+	t := msgTag{hostID: d.hostID, gen: d.gen}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		objs, err := dock.SystemDiskUsage(ctx)
+		return diskLoadedMsg{msgTag: t, objs: objs, err: err}
+	}
+}
+
 func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 	switch msg := msg.(type) {
 	case statsTickMsg:
@@ -174,14 +190,21 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		return d, nil
 
 	case actionDoneMsg:
+		label := msg.verb
+		if msg.name != "" {
+			label += " " + msg.name
+		}
 		if msg.err != nil {
-			d.toast = msg.verb + " " + msg.name + " failed: " + msg.err.Error()
+			d.toast = label + " failed: " + msg.err.Error()
 			d.toastIsErr = true
 		} else {
-			d.toast = msg.verb + " " + msg.name + " ok"
+			d.toast = label + " ok"
 			d.toastIsErr = false
 		}
 		d.errMsg = ""
+		if d.showDisk {
+			return d, tea.Batch(d.fetchNow(), d.fetchDisk())
+		}
 		return d, d.fetchNow()
 
 	case detailLoadedMsg:
@@ -198,6 +221,16 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		d.detail.loading = false
 		return d, nil
 
+	case diskLoadedMsg:
+		d.diskLoading = false
+		if msg.err != nil {
+			d.diskErr = msg.err.Error()
+		} else {
+			d.disk = msg.objs
+			d.diskErr = ""
+		}
+		return d, nil
+
 	case tea.KeyMsg:
 		if d.detail != nil {
 			switch msg.String() {
@@ -211,12 +244,26 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			case "y", "Y":
 				verb := d.confirm
 				d.confirm = ""
+				dock := d.dock
+				t := msgTag{hostID: d.hostID, gen: d.gen}
+				if strings.HasPrefix(verb, "prune") {
+					return d, func() tea.Msg {
+						ctx, cancel := context.WithTimeout(context.Background(), 125*time.Second)
+						defer cancel()
+						var err error
+						switch verb {
+						case "prune images":
+							err = dock.PruneImages(ctx)
+						case "prune system":
+							err = dock.PruneSystem(ctx)
+						}
+						return actionDoneMsg{msgTag: t, verb: verb, err: err}
+					}
+				}
 				c, ok := d.selected()
 				if !ok {
 					return d, nil
 				}
-				dock := d.dock
-				t := msgTag{hostID: d.hostID, gen: d.gen}
 				return d, func() tea.Msg {
 					ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 					defer cancel()
@@ -228,6 +275,8 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 						err = dock.Stop(ctx, c.ID)
 					case "restart":
 						err = dock.Restart(ctx, c.ID)
+					case "rm":
+						err = dock.Rm(ctx, c.ID)
 					}
 					return actionDoneMsg{msgTag: t, verb: verb, name: c.ShortName(), err: err}
 				}
@@ -237,6 +286,21 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			default:
 				d.confirm = ""
 			}
+		}
+		if d.showDisk {
+			switch msg.String() {
+			case "esc":
+				d.showDisk = false
+			case "f":
+				d.diskLoading = true
+				d.diskErr = ""
+				return d, d.fetchDisk()
+			case "p":
+				d.confirm = "prune images"
+			case "P":
+				d.confirm = "prune system"
+			}
+			return d, nil
 		}
 		if k := msg.String(); k == " " || k == "space" {
 			d.toggleFold()
@@ -271,6 +335,21 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		case "r":
 			if _, ok := d.selected(); ok {
 				d.confirm = "restart"
+			}
+			return d, nil
+		case "i":
+			d.showDisk = true
+			d.diskLoading = true
+			d.diskErr = ""
+			return d, d.fetchDisk()
+		case "D":
+			if c, ok := d.selected(); ok {
+				if c.State == "exited" || c.State == "dead" || c.State == "created" {
+					d.confirm = "rm"
+				} else {
+					d.toast = "only stopped containers can be removed"
+					d.toastIsErr = true
+				}
 			}
 			return d, nil
 		case "d":
@@ -435,9 +514,13 @@ func (d *Dashboard) View() string {
 		b.WriteString(styleErr.Render("connection lost — press c to reconnect, esc to go back") + "\n")
 	}
 	if d.confirm != "" {
-		if c, ok := d.selected(); ok {
-			b.WriteString(styleWarn.Render(fmt.Sprintf("%s %s? [y/N]", d.confirm, c.ShortName())) + "\n")
+		label := d.confirm
+		if !strings.HasPrefix(label, "prune") {
+			if c, ok := d.selected(); ok {
+				label = fmt.Sprintf("%s %s", d.confirm, c.ShortName())
+			}
 		}
+		b.WriteString(styleWarn.Render(label+"? [y/N]") + "\n")
 	} else if d.toast != "" {
 		if d.toastIsErr {
 			b.WriteString(styleErr.Render(d.toast) + "\n")
@@ -462,6 +545,23 @@ func (d *Dashboard) View() string {
 		b.WriteString(helpLine("esc", "close", "d", "close", "f", "refresh") + "\n")
 		return b.String()
 	}
+	if d.showDisk {
+		b.WriteString(styleTitle.Render("disk usage") + "\n")
+		if d.diskLoading {
+			b.WriteString(styleMuted.Render("querying\u2026") + "\n")
+		} else if d.diskErr != "" {
+			b.WriteString(styleErr.Render(d.diskErr) + "\n")
+		} else if len(d.disk) == 0 {
+			b.WriteString(styleMuted.Render("no data") + "\n")
+		} else {
+			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s %8s %8s %12s %12s", "TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE")) + "\n")
+			for _, o := range d.disk {
+				b.WriteString(fmt.Sprintf("%-12s %8s %8s %12s %12s\n", o.Type, o.Total, o.Active, o.Size, o.Reclaimable))
+			}
+		}
+		b.WriteString(helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close") + "\n")
+		return b.String()
+	}
 	if len(d.containers) == 0 && d.errMsg == "" && !d.disconnected {
 		b.WriteString(styleMuted.Render("no containers found on this host") + "\n")
 	}
@@ -469,7 +569,7 @@ func (d *Dashboard) View() string {
 	if d.disconnected {
 		b.WriteString(helpLine("c", "reconnect", "esc", "back") + "\n")
 	} else {
-		b.WriteString(helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "f", "refresh", "esc", "back") + "\n")
+		b.WriteString(helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "i", "disk", "f", "refresh", "esc", "back") + "\n")
 	}
 	return b.String()
 }

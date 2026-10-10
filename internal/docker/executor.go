@@ -185,6 +185,57 @@ func (e *Executor) Restart(ctx context.Context, id string) error {
 	return err
 }
 
+type dfJSON struct {
+	Type        string `json:"Type"`
+	Total       string `json:"TotalCount"`
+	Active      string `json:"Active"`
+	Size        string `json:"Size"`
+	Reclaimable string `json:"Reclaimable"`
+}
+
+func (e *Executor) SystemDiskUsage(ctx context.Context) ([]models.DiskObject, error) {
+	out, err := e.exec(ctx, 20*time.Second, `docker system df --format '{{json .}}'`)
+	if err != nil {
+		return nil, err
+	}
+	return parseDF(out), nil
+}
+
+// parseDF parses the NDJSON produced by `docker system df --format '{{json .}}'`.
+func parseDF(out string) []models.DiskObject {
+	var res []models.DiskObject
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var j dfJSON
+		if err := json.Unmarshal([]byte(line), &j); err != nil {
+			continue
+		}
+		res = append(res, models.DiskObject{
+			Type: j.Type, Total: j.Total, Active: j.Active,
+			Size: j.Size, Reclaimable: j.Reclaimable,
+		})
+	}
+	return res
+}
+
+func (e *Executor) PruneImages(ctx context.Context) error {
+	_, err := e.exec(ctx, 120*time.Second, `docker image prune -f`)
+	return err
+}
+
+func (e *Executor) PruneSystem(ctx context.Context) error {
+	_, err := e.exec(ctx, 120*time.Second, `docker system prune -f`)
+	return err
+}
+
+func (e *Executor) Rm(ctx context.Context, id string) error {
+	_, err := e.exec(ctx, 30*time.Second, "docker rm "+quote(id))
+	return err
+}
+
 func (e *Executor) StreamLogs(ctx context.Context, id string) (io.ReadCloser, error) {
 	return e.conn.StreamExec(ctx, "docker logs -f --tail 200 "+quote(id))
 }

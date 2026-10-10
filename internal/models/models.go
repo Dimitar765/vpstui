@@ -108,3 +108,11 @@ type HostStats struct {
 	NumCPU     int
 	UptimeSec  float64
 }
+
+type DiskObject struct {
+	Type        string
+	Total       string
+	Active      string
+	Size        string
+	Reclaimable string
+}

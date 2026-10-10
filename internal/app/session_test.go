@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -230,5 +231,118 @@ func TestSpaceKeyFoldsGroup(t *testing.T) {
 	_, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace})
 	if d.collapsed["web"] || len(d.rowCIdx) != 2 {
 		t.Fatalf("space did not unfold: %v rows=%d", d.collapsed, len(d.rowCIdx))
+	}
+}
+
+func key(k string) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+}
+
+func TestDiskPanelOpenFillAndClose(t *testing.T) {
+	d := NewDashboard(host("h"), nil, 80, 24, 1)
+	_, cmd := d.Update(key("i"))
+	if !d.showDisk || !d.diskLoading || cmd == nil {
+		t.Fatalf("i: showDisk=%v loading=%v cmd=%v", d.showDisk, d.diskLoading, cmd != nil)
+	}
+	d.Update(diskLoadedMsg{msgTag: msgTag{hostID: "h", gen: 1}, objs: []models.DiskObject{
+		{Type: "Images", Total: "7", Active: "4", Size: "2.5GB", Reclaimable: "500MB (20%)"},
+	}})
+	if d.diskLoading || len(d.disk) != 1 || d.diskErr != "" {
+		t.Fatalf("after load: loading=%v disk=%+v err=%q", d.diskLoading, d.disk, d.diskErr)
+	}
+	v := d.View()
+	if !strings.Contains(v, "RECLAIMABLE") || !strings.Contains(v, "2.5GB") {
+		t.Fatalf("View missing panel data:\n%s", v)
+	}
+	// esc closes the panel, not the dashboard
+	d.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	if d.showDisk || d.TakeBack() {
+		t.Fatalf("esc: showDisk=%v back=%v", d.showDisk, d.back)
+	}
+}
+
+func TestPruneConfirmNeedsNoSelection(t *testing.T) {
+	d := NewDashboard(host("h"), nil, 80, 24, 1) // zero containers
+	d.Update(key("i"))
+	for _, k := range []struct {
+		key  string
+		verb string
+	}{{"p", "prune images"}, {"P", "prune system"}} {
+		d.Update(key(k.key))
+		if d.confirm != k.verb {
+			t.Fatalf("%s: confirm=%q want %q", k.key, d.confirm, k.verb)
+		}
+		_, cmd := d.Update(key("y"))
+		if cmd == nil {
+			t.Fatalf("%s: y produced nil cmd (prune blocked by empty selection?)", k.key)
+		}
+		if d.confirm != "" {
+			t.Fatalf("confirm not cleared")
+		}
+		// View must render the prompt without a selected container
+		d.Update(key(k.key))
+		if v := d.View(); !strings.Contains(v, k.verb+"? [y/N]") {
+			t.Fatalf("confirm line missing in view:\n%s", v)
+		}
+		d.Update(key("n"))
+		if d.confirm != "" {
+			t.Fatal("n did not cancel confirm")
+		}
+	}
+}
+
+func TestRmKeyGating(t *testing.T) {
+	mk := func(state string) *Dashboard {
+		d := NewDashboard(host("h"), nil, 80, 24, 1)
+		d.containers = []models.Container{{ID: "c1", Names: "c1", State: state, Status: state}}
+		d.rebuild()
+		d.tbl.SetCursor(0)
+		return d
+	}
+	run := mk("running")
+	run.Update(key("D"))
+	if run.confirm != "" {
+		t.Fatal("D on running container must not arm confirm")
+	}
+	if !strings.Contains(run.toast, "only stopped") || !run.toastIsErr {
+		t.Fatalf("toast=%q isErr=%v", run.toast, run.toastIsErr)
+	}
+	stopped := mk("exited")
+	stopped.Update(key("D"))
+	if stopped.confirm != "rm" {
+		t.Fatalf("confirm=%q, want rm", stopped.confirm)
+	}
+	_, cmd := stopped.Update(key("y"))
+	if cmd == nil {
+		t.Fatal("rm y produced nil cmd")
+	}
+}
+
+func TestStaleDiskMsgDropped(t *testing.T) {
+	m := New(nil)
+	s := &Session{host: host("a"), gen: 2}
+	s.dash = NewDashboard(s.host, nil, 80, 24, s.gen)
+	m.sessions = []*Session{s}
+	m.active = 0
+	m.view = viewDashboard
+
+	_, cmd := m.Update(diskLoadedMsg{msgTag: msgTag{hostID: "a", gen: 1}, objs: []models.DiskObject{{Type: "Images"}}})
+	if cmd != nil {
+		t.Fatal("stale disk msg produced a command")
+	}
+	if s.dash.disk != nil {
+		t.Fatalf("stale disk msg applied: %+v", s.dash.disk)
+	}
+}
+
+func TestActionDoneBatchRefetchesDisk(t *testing.T) {
+	d := NewDashboard(host("h"), nil, 80, 24, 1)
+	d.showDisk = true
+	_, cmd := d.Update(actionDoneMsg{msgTag: msgTag{hostID: "h", gen: 1}, verb: "prune images", err: nil})
+	if cmd == nil {
+		t.Fatal("prune success produced no refresh cmd")
+	}
+	if !strings.Contains(d.toast, "prune images ok") {
+		t.Fatalf("toast=%q", d.toast)
 	}
 }
