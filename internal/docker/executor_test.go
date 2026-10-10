@@ -329,3 +329,30 @@ func TestParseDFMalformed(t *testing.T) {
 		t.Errorf("parseDF(\"\") = %+v, want nil", res)
 	}
 }
+
+func TestShellCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		term string
+		want string
+	}{
+		{
+			name: "plain id and term",
+			id:   "abc123", term: "xterm-256color",
+			want: `docker exec -i -t -e TERM='xterm-256color' 'abc123' sh -c 'exec bash 2>/dev/null || exec /bin/sh'`,
+		},
+		{
+			name: "id with quote is escaped",
+			id:   "we'ird", term: "dumb",
+			want: `docker exec -i -t -e TERM='dumb' 'we'\''ird' sh -c 'exec bash 2>/dev/null || exec /bin/sh'`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShellCommand(tt.id, tt.term); got != tt.want {
+				t.Errorf("ShellCommand() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

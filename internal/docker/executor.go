@@ -240,6 +240,20 @@ func (e *Executor) StreamLogs(ctx context.Context, id string) (io.ReadCloser, er
 	return e.conn.StreamExec(ctx, "docker logs -f --tail 200 "+quote(id))
 }
 
+// ShellCommand builds the SSH-level command for an interactive container
+// shell, preferring bash and falling back to /bin/sh. term must already be
+// sanitized by the caller.
+func ShellCommand(id, term string) string {
+	return "docker exec -i -t -e TERM=" + quote(term) + " " + quote(id) +
+		" sh -c " + quote("exec bash 2>/dev/null || exec /bin/sh")
+}
+
+// ProbeShell checks that the container has a POSIX shell, without a PTY.
+func (e *Executor) ProbeShell(ctx context.Context, id string) error {
+	_, err := e.exec(ctx, 10*time.Second, "docker exec -i "+quote(id)+" sh -c exit")
+	return err
+}
+
 func (e *Executor) Inspect(ctx context.Context, id string) (models.ContainerDetail, error) {
 	out, err := e.exec(ctx, 15*time.Second, "docker inspect "+quote(id))
 	if err != nil {
