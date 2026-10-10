@@ -358,19 +358,16 @@ func (m *Model) sessionKeys(key string) (bool, tea.Cmd) {
 	}
 	switch key {
 	case "tab":
-		m.activate((m.active + 1) % len(m.sessions))
-		return true, nil
+		return true, m.activate((m.active + 1) % len(m.sessions))
 	case "shift+tab":
-		m.activate((m.active - 1 + len(m.sessions)) % len(m.sessions))
-		return true, nil
+		return true, m.activate((m.active - 1 + len(m.sessions)) % len(m.sessions))
 	case "X":
 		return true, m.closeActive()
 	}
 	if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
 		i := int(key[0] - '1')
 		if i < len(m.sessions) {
-			m.activate(i)
-			return true, nil
+			return true, m.activate(i)
 		}
 	}
 	return false, nil
@@ -721,7 +718,10 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 		m.view = viewDashboard
 		m.active = m.indexOf(s)
 	}
-	return m, tea.Batch(s.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
+	if m.view == viewDashboard && m.active == m.indexOf(s) {
+		return m, tea.Batch(s.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
+	}
+	return m, nil
 }
 
 func startLogStream(s *Session, id string, send func(tea.Msg)) tea.Cmd {

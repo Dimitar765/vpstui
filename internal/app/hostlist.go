@@ -42,6 +42,7 @@ func NewHostList(hosts []models.Host) *HostList {
 	l.SetShowStatusBar(false)
 	l.SetShowHelp(false)
 	l.SetFilteringEnabled(false)
+	l.DisableQuitKeybindings()
 	return &HostList{l: l, hosts: hosts}
 }
 
@@ -87,8 +88,16 @@ func (l *HostList) Update(msg tea.Msg) (*HostList, tea.Cmd) {
 			return l, func() tea.Msg { return deleteHostReq{host: h} }
 		}
 	}
-	if km, ok := msg.(tea.KeyMsg); ok && km.String() == "n" {
-		return l, func() tea.Msg { return newHostReq{} }
+	if km, ok := msg.(tea.KeyMsg); ok {
+		switch km.String() {
+		case "n":
+			return l, func() tea.Msg { return newHostReq{} }
+		case "esc":
+			return l, nil
+		}
+		var cmd tea.Cmd
+		l.l, cmd = l.l.Update(msg)
+		return l, cmd
 	}
 	var cmd tea.Cmd
 	l.l, cmd = l.l.Update(msg)
