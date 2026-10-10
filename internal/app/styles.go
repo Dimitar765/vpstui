@@ -60,3 +60,18 @@ func helpLine(pairs ...string) string {
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, b...)
 }
+
+// pinFooter places body at the top of a height-row frame and footer on its
+// last row. If the body is taller than the frame the footer simply follows.
+func pinFooter(body, footer string, height int) string {
+	body = strings.TrimRight(body, "\n")
+	footer = strings.TrimRight(footer, "\n")
+	if footer == "" {
+		return body
+	}
+	gap := height - lipgloss.Height(body) - lipgloss.Height(footer)
+	if gap < 0 {
+		gap = 0
+	}
+	return body + strings.Repeat("\n", gap+1) + footer
+}

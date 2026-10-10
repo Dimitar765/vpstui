@@ -222,12 +222,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.form != nil {
 			m.form.SetSize(msg.Width)
 		}
+		contentH := msg.Height - m.tabRows()
 		for _, s := range m.sessions {
 			if s.dash != nil {
-				s.dash.SetSize(msg.Width, msg.Height)
+				s.dash.SetSize(msg.Width, contentH)
 			}
 			if s.cv != nil {
-				s.cv.SetSize(msg.Width, msg.Height)
+				s.cv.SetSize(msg.Width, contentH)
 			}
 		}
 		return m, nil
@@ -351,7 +352,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if req, ok := s.dash.OpenLogs(); ok {
-			s.cv = NewContainerView(req.id, req.name, m.width, m.height)
+			s.cv = NewContainerView(req.id, req.name, m.width, m.height-m.tabRows())
 			s.cv.hostID = s.dash.hostID
 			s.cv.gen = s.dash.gen
 			m.view = viewContainer
@@ -597,18 +598,18 @@ func (m *Model) View() string {
 	}
 	switch m.view {
 	case viewHosts:
-		out := styleTitle.Render("vpstui — VPS & containers over SSH") + "\n\n" + m.list.View()
+		body := styleTitle.Render("vpstui — VPS & containers over SSH") + "\n\n" + m.list.View()
 		if m.status != "" {
-			out += "\n" + styleWarn.Render(m.status)
+			body += "\n" + styleWarn.Render(m.status)
 			m.status = ""
 		}
-		out += "\n" + helpLine("n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit")
-		return out
+		return pinFooter(body, helpLine("n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.height)
 	case viewForm, viewPrompt:
-		return m.form.View(m.width)
+		return pinFooter(m.form.View(m.width), m.form.Help(), m.height)
 	case viewConnecting:
-		return m.tabBar() + "\n" + m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…" +
+		body := m.tabBar() + "\n" + m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…" +
 			styleMuted.Render("  (esc: keep dialing in background)")
+		return pinFooter(body, "", m.height-m.tabRows())
 	case viewDashboard:
 		if s := m.activeSession(); s != nil && s.dash != nil {
 			return m.tabBar() + "\n" + s.dash.View()
@@ -621,6 +622,14 @@ func (m *Model) View() string {
 		return m.tabBar()
 	}
 	return ""
+}
+
+// tabRows is the number of layout rows the session tab bar occupies.
+func (m *Model) tabRows() int {
+	if len(m.sessions) == 0 {
+		return 0
+	}
+	return 1
 }
 
 func (m *Model) tabBar() string {
@@ -804,7 +813,7 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 	}
 	s.conn = msg.conn
 	s.dock = docker.New(msg.conn)
-	s.dash = NewDashboard(msg.host, s.dock, m.width, m.height, msg.gen)
+	s.dash = NewDashboard(msg.host, s.dock, m.width, m.height-m.tabRows(), msg.gen)
 	m.refreshConnected()
 	if m.view == viewConnecting && m.pendingGen == msg.gen {
 		m.view = viewDashboard

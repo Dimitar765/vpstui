@@ -645,8 +645,7 @@ func (d *Dashboard) View() string {
 		} else {
 			b.WriteString(d.detail.text)
 		}
-		b.WriteString(helpLine("esc", "close", "d", "close", "f", "refresh") + "\n")
-		return b.String()
+		return pinFooter(b.String(), helpLine("esc", "close", "d", "close", "f", "refresh"), d.height)
 	}
 	if d.showDisk {
 		b.WriteString(styleTitle.Render("disk usage") + "\n")
@@ -662,17 +661,17 @@ func (d *Dashboard) View() string {
 				b.WriteString(fmt.Sprintf("%-12s %8s %8s %12s %12s\n", o.Type, o.Total, o.Active, o.Size, o.Reclaimable))
 			}
 		}
-		b.WriteString(helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close") + "\n")
-		return b.String()
+		return pinFooter(b.String(), helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close"), d.height)
 	}
 	if len(d.containers) == 0 && d.errMsg == "" && !d.disconnected {
 		b.WriteString(styleMuted.Render("no containers found on this host") + "\n")
 	}
 	b.WriteString(d.tbl.View() + "\n")
+	var footer string
 	if d.disconnected {
-		b.WriteString(helpLine("c", "reconnect", "esc", "back") + "\n")
+		footer = helpLine("c", "reconnect", "esc", "back")
 	} else {
-		b.WriteString(helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back") + "\n")
+		footer = helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back")
 	}
-	return b.String()
+	return pinFooter(b.String(), footer, d.height)
 }

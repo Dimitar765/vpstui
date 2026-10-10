@@ -1,6 +1,13 @@
 package app
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"vpstui/internal/models"
+)
 
 func TestAllocCols(t *testing.T) {
 	cases := []struct {
@@ -45,4 +52,34 @@ func TestColsFor(t *testing.T) {
 	if got := base[0].width + base[1].width; got != 100-staticColsW(100) {
 		t.Errorf("colsFor(100) name+image=%d want %d", got, 100-staticColsW(100))
 	}
+}
+
+func TestDashboardPinsFooter(t *testing.T) {
+	d := NewDashboard(host("h"), nil, 100, 30, 1)
+	d.containers = []models.Container{{ID: "c1", Names: "c1", State: "running", Status: "Up 1 hour"}}
+	d.rebuild()
+	v := d.View()
+	if h := lipgloss.Height(v); h != 30 {
+		t.Errorf("dashboard height = %d, want 30 (pinned frame)", h)
+	}
+	last := strings.Split(v, "\n")[h(v)-1]
+	if !strings.Contains(last, "esc") || !strings.Contains(last, "back") {
+		t.Errorf("footer not on last row: %q", last)
+	}
+	// disk panel pins its footer too
+	d.showDisk = true
+	v = d.View()
+	if h := lipgloss.Height(v); h != 30 {
+		t.Errorf("disk panel height = %d, want 30", h)
+	}
+	if last := lastLine(v); !strings.Contains(last, "prune") {
+		t.Errorf("disk footer not pinned: %q", last)
+	}
+}
+
+func h(s string) int { return lipgloss.Height(s) }
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	return lines[len(lines)-1]
 }

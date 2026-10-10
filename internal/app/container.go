@@ -20,13 +20,15 @@ type ContainerView struct {
 	buf      strings.Builder
 	err      string
 	running  bool
+	width    int
+	height   int
 
 	cancel context.CancelFunc
 	reader io.ReadCloser
 }
 
 func NewContainerView(id, name string, w, h int) *ContainerView {
-	c := &ContainerView{id: id, name: name, running: true}
+	c := &ContainerView{id: id, name: name, running: true, width: w, height: h}
 	c.vp = viewport.New(max(w-2, 20), max(h-4, 5))
 	return c
 }
@@ -102,6 +104,7 @@ func (c *ContainerView) StreamDone(err error) {
 }
 
 func (c *ContainerView) SetSize(w, h int) {
+	c.width, c.height = w, h
 	c.vp.Width = max(w-2, 20)
 	c.vp.Height = max(h-4, 5)
 }
@@ -120,9 +123,8 @@ func (c *ContainerView) View() string {
 	} else if !c.running {
 		b.WriteString(styleMuted.Render("stream ended") + "\n")
 	} else {
-		b.WriteString(styleMuted.Render("streaming…") + "\n")
+		b.WriteString(styleOK.Render("● streaming…") + "\n")
 	}
 	b.WriteString(c.vp.View() + "\n")
-	b.WriteString(helpLine("↑/↓", "scroll", "pgup/pgdn", "page", "esc", "back") + "\n")
-	return b.String()
+	return pinFooter(b.String(), helpLine("↑/↓", "scroll", "pgup/pgdn", "page", "esc", "back"), c.height)
 }

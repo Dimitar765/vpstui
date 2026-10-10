@@ -274,7 +274,6 @@ func (f *HostForm) View(_ int) string {
 		ti := f.secret
 		ti.Prompt = styleKey.Render(ti.Prompt)
 		b.WriteString(ti.View() + "\n\n")
-		b.WriteString(helpLine("enter", "submit", "esc", "cancel") + "\n")
 		return b.String()
 	}
 	b.WriteString(styleTitle.Render("Host details") + " " + styleMuted.Render("(esc to cancel)") + "\n\n")
@@ -304,6 +303,12 @@ func (f *HostForm) View(_ int) string {
 	if f.err != "" {
 		b.WriteString(styleErr.Render(f.err) + "\n")
 	}
-	b.WriteString(helpLine("up/down", "fields", "enter", "next / save", "esc", "cancel") + "\n")
 	return b.String()
+}
+
+func (f *HostForm) Help() string {
+	if f.mode == modeSecret {
+		return helpLine("enter", "submit", "esc", "cancel")
+	}
+	return helpLine("up/down", "fields", "enter", "next / save", "esc", "cancel")
 }
