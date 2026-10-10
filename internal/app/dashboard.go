@@ -73,9 +73,59 @@ var dashCols = []ctableCol{
 	{title: "MEM USAGE", width: 18, kind: cellPlain},
 }
 
+const cellGapTotal = 12 // 2-space gap × 6 between seven columns
+
+// staticColsW returns the width consumed by all non-adaptive columns
+// (State, CPU, MEM, gaps) plus Status and MEM USAGE at the given total.
+func staticColsW(total int) int {
+	usage, status := 18, 18
+	if total < 110 {
+		usage = 12
+	}
+	if total < 90 {
+		status = 12
+	}
+	return 12 + 7 + 7 + status + usage + cellGapTotal
+}
+
+// allocCols splits the remaining width between Name and Image (3:2),
+// honoring floors of 12 and 10.
+func allocCols(total int) (nameW, imageW int) {
+	nameW, imageW = 12, 10
+	slack := total - staticColsW(total)
+	if slack <= nameW+imageW {
+		return nameW, imageW
+	}
+	n := slack * 3 / 5
+	i := slack - n
+	if n < nameW {
+		n = nameW
+		i = max(slack-n, imageW)
+	} else if i < imageW {
+		i = imageW
+		n = max(slack-i, nameW)
+	}
+	return n, i
+}
+
+// colsFor returns the column set sized for a table area of total width.
+func colsFor(total int) []ctableCol {
+	c := make([]ctableCol, len(dashCols))
+	copy(c, dashCols)
+	c[6].width, c[3].width = 18, 18
+	if total < 110 {
+		c[6].width = 12
+	}
+	if total < 90 {
+		c[3].width = 12
+	}
+	c[0].width, c[1].width = allocCols(total)
+	return c
+}
+
 func NewDashboard(host models.Host, dock *docker.Executor, w, h int, gen uint64) *Dashboard {
 	d := &Dashboard{host: host, dock: dock, hostID: host.ID, gen: gen, stats: map[string]models.ContainerStats{}, collapsed: map[string]bool{}, width: w, height: h}
-	d.tbl.SetColumns(dashCols)
+	d.tbl.SetColumns(colsFor(max(w-2, 20)))
 	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
 	return d
 }
@@ -86,6 +136,7 @@ func (d *Dashboard) tag(hostID string, gen uint64) bool {
 
 func (d *Dashboard) SetSize(w, h int) {
 	d.width, d.height = w, h
+	d.tbl.SetColumns(colsFor(max(w-2, 20)))
 	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
 }
 
