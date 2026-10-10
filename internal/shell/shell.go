@@ -20,8 +20,9 @@ import (
 	"vpstui/internal/sshclient"
 )
 
-// Exit codes reserved by the child for setup failures. A remote shell always
-// exits through the PTY bridge with code 0 from the child's point of view.
+// Exit codes reserved by the child for setup failures. A remote shell exits
+// through the PTY bridge with its own remote exit status, which may collide
+// with these values; the parent distinguishes them by stderr content.
 const (
 	ExitArgs = 2
 	ExitDial = 3
@@ -132,7 +133,6 @@ func Main(args []string) int {
 	code, err := bridge(conn, cid)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vpstui _shell:", err)
-		return code
 	}
-	return 0
+	return code
 }

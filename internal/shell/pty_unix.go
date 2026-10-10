@@ -17,7 +17,8 @@ import (
 )
 
 // bridge runs the interactive session and blocks until the remote shell
-// exits. It returns (exitCode, err); a normal remote exit yields (0, nil).
+// exits. It returns (exitCode, err); a normal remote exit yields the remote
+// exit status and a nil error.
 func bridge(conn *sshclient.Conn, cid string) (int, error) {
 	fd := int(os.Stdin.Fd())
 	cols, rows, err := term.GetSize(fd)
@@ -59,7 +60,7 @@ func bridge(conn *sshclient.Conn, cid string) (int, error) {
 	err = p.Wait()
 	var ee *ssh.ExitError
 	if errors.As(err, &ee) {
-		return 0, nil // remote shell exited normally
+		return ee.ExitStatus(), nil // remote shell exit code; 0 on normal exit
 	}
 	if err != nil {
 		return ExitPty, err // transport dropped mid-session

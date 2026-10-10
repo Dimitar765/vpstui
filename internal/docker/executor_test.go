@@ -340,12 +340,12 @@ func TestShellCommand(t *testing.T) {
 		{
 			name: "plain id and term",
 			id:   "abc123", term: "xterm-256color",
-			want: `docker exec -i -t -e TERM='xterm-256color' 'abc123' sh -c 'exec bash 2>/dev/null || exec /bin/sh'`,
+			want: `docker exec -i -t -e TERM='xterm-256color' 'abc123' sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec /bin/sh'`,
 		},
 		{
 			name: "id with quote is escaped",
 			id:   "we'ird", term: "dumb",
-			want: `docker exec -i -t -e TERM='dumb' 'we'\''ird' sh -c 'exec bash 2>/dev/null || exec /bin/sh'`,
+			want: `docker exec -i -t -e TERM='dumb' 'we'\''ird' sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec /bin/sh'`,
 		},
 	}
 	for _, tt := range tests {

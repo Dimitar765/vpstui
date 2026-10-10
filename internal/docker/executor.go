@@ -241,11 +241,12 @@ func (e *Executor) StreamLogs(ctx context.Context, id string) (io.ReadCloser, er
 }
 
 // ShellCommand builds the SSH-level command for an interactive container
-// shell, preferring bash and falling back to /bin/sh. term must already be
-// sanitized by the caller.
+// shell, preferring bash and falling back to /bin/sh. A failed `exec` exits
+// the wrapper shell, so bash is probed with command -v first. term must
+// already be sanitized by the caller.
 func ShellCommand(id, term string) string {
 	return "docker exec -i -t -e TERM=" + quote(term) + " " + quote(id) +
-		" sh -c " + quote("exec bash 2>/dev/null || exec /bin/sh")
+		" sh -c " + quote("command -v bash >/dev/null 2>&1 && exec bash || exec /bin/sh")
 }
 
 // ProbeShell checks that the container has a POSIX shell, without a PTY.
