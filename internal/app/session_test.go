@@ -346,3 +346,65 @@ func TestActionDoneBatchRefetchesDisk(t *testing.T) {
 		t.Fatalf("toast=%q", d.toast)
 	}
 }
+
+func mkDash(state string) *Dashboard {
+	d := NewDashboard(host("h"), nil, 80, 24, 1)
+	d.containers = []models.Container{{ID: "c1", Names: "c1", State: state, Status: state}}
+	d.rebuild()
+	d.tbl.SetCursor(0)
+	return d
+}
+
+func TestShellKeyGatingAndRequest(t *testing.T) {
+	run := mkDash("running")
+	run.Update(key("e"))
+	req, ok := run.OpenShell()
+	if !ok || req.id != "c1" || req.name != "c1" {
+		t.Fatalf("running e: ok=%v req=%+v", ok, req)
+	}
+	if _, ok := run.OpenShell(); ok {
+		t.Fatal("OpenShell must consume the request once")
+	}
+	exited := mkDash("exited")
+	exited.Update(key("e"))
+	if _, ok := exited.OpenShell(); ok {
+		t.Fatal("exited container must not arm shell")
+	}
+	if !strings.Contains(exited.toast, "running container") || !exited.toastIsErr {
+		t.Fatalf("toast=%q isErr=%v", exited.toast, exited.toastIsErr)
+	}
+}
+
+func TestShellExitedToast(t *testing.T) {
+	d := mkDash("running")
+	_, cmd := d.Update(shellExitedMsg{msgTag: msgTag{hostID: "h", gen: 1}, name: "c1"})
+	if cmd == nil || d.toast != "shell c1 ended" || d.toastIsErr {
+		t.Fatalf("clean exit: cmd=%v toast=%q isErr=%v", cmd != nil, d.toast, d.toastIsErr)
+	}
+	d.Update(shellExitedMsg{msgTag: msgTag{hostID: "h", gen: 1}, name: "c1", err: errDial, detail: "child said nope"})
+	if d.toast != "shell c1 failed: child said nope" || !d.toastIsErr {
+		t.Fatalf("failure toast: %q", d.toast)
+	}
+}
+
+func TestStaleShellMsgDropped(t *testing.T) {
+	m := New(nil)
+	s := &Session{host: host("a"), gen: 2}
+	s.dash = mkDash("running")
+	s.dash.gen = 2
+	m.sessions = []*Session{s}
+	m.active = 0
+	m.view = viewDashboard
+
+	_, cmd := m.Update(shellExitedMsg{msgTag: msgTag{hostID: "a", gen: 1}, name: "c1"})
+	if cmd != nil {
+		t.Fatal("stale shellExitedMsg produced a command")
+	}
+	if s.dash.toast != "" {
+		t.Fatalf("stale msg applied toast=%q", s.dash.toast)
+	}
+	_, cmd = m.Update(shellProbeDoneMsg{msgTag: msgTag{hostID: "a", gen: 99}, req: containerReq{id: "c1", name: "c1"}})
+	if cmd != nil {
+		t.Fatal("unknown-gen probe result produced a command")
+	}
+}

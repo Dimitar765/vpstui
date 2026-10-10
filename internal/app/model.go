@@ -1,8 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"vpstui/internal/docker"
 	"vpstui/internal/models"
 	"vpstui/internal/secret"
+	"vpstui/internal/shell"
 	"vpstui/internal/sshclient"
 )
 
@@ -81,6 +85,19 @@ type diskLoadedMsg struct {
 	msgTag
 	objs []models.DiskObject
 	err  error
+}
+
+type shellExitedMsg struct {
+	msgTag
+	name   string
+	err    error
+	detail string
+}
+
+type shellProbeDoneMsg struct {
+	msgTag
+	req containerReq
+	err error
 }
 
 // Session is one live (or dialing) connection to a host. Only the active
@@ -225,7 +242,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, detailLoadedMsg, diskLoadedMsg:
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, detailLoadedMsg, diskLoadedMsg, shellExitedMsg, shellProbeDoneMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -339,6 +356,9 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.cv.gen = s.dash.gen
 			m.view = viewContainer
 			return m, startLogStream(s, req.id, m.send)
+		}
+		if req, ok := s.dash.OpenShell(); ok {
+			return m, s.dash.probeShell(req)
 		}
 		return m, cmd
 
@@ -463,6 +483,10 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case diskLoadedMsg:
 		t = msg.msgTag
+	case shellExitedMsg:
+		t = msg.msgTag
+	case shellProbeDoneMsg:
+		t = msg.msgTag
 	}
 	s := m.findSession(t.hostID, t.gen)
 	if s == nil {
@@ -507,8 +531,45 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.dash, _ = s.dash.Update(msg)
 		}
 		return m, nil
+	case shellExitedMsg:
+		if s.dash != nil {
+			var cmd tea.Cmd
+			s.dash, cmd = s.dash.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	case shellProbeDoneMsg:
+		if s.dash == nil {
+			return m, nil
+		}
+		if msg.err != nil {
+			s.dash, _ = s.dash.Update(shellExitedMsg{msgTag: t, name: msg.req.name, err: msg.err})
+			return m, nil
+		}
+		return m, m.suspendForShell(s, msg.req)
 	}
 	return m, nil
+}
+
+// suspendForShell re-invokes the binary as a PTY-bridging child; bubbletea
+// releases the terminal for the duration and resumes us when it exits.
+func (m *Model) suspendForShell(s *Session, req containerReq) tea.Cmd {
+	t := msgTag{hostID: s.host.ID, gen: s.gen}
+	exe, err := os.Executable()
+	if err != nil {
+		return func() tea.Msg { return shellExitedMsg{msgTag: t, name: req.name, err: err} }
+	}
+	var stderr bytes.Buffer
+	cmd := exec.Command(exe, "_shell", "--host", s.host.ID, "--cid", req.id)
+	cmd.Stderr = &stderr
+	return tea.ExecProcess(cmd, func(rerr error) tea.Msg {
+		return shellExitedMsg{
+			msgTag: t,
+			name:   req.name,
+			err:    rerr,
+			detail: shell.FailureMessage(rerr, stderr.String()),
+		}
+	})
 }
 
 func (m *Model) routeInternal(msg tea.Msg) (tea.Model, tea.Cmd) {

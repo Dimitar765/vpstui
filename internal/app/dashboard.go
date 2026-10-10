@@ -60,6 +60,7 @@ type Dashboard struct {
 	width, height int
 	back          bool
 	logReq        *containerReq
+	shellReq      *containerReq
 }
 
 var tableColumns = []table.Column{
@@ -111,6 +112,15 @@ func (d *Dashboard) OpenLogs() (containerReq, bool) {
 	return r, true
 }
 
+func (d *Dashboard) OpenShell() (containerReq, bool) {
+	if d.shellReq == nil {
+		return containerReq{}, false
+	}
+	r := *d.shellReq
+	d.shellReq = nil
+	return r, true
+}
+
 func (d *Dashboard) selected() (models.Container, bool) {
 	idx := d.tbl.Cursor()
 	if idx < 0 || idx >= len(d.rowCIdx) {
@@ -157,6 +167,17 @@ func (d *Dashboard) fetchDisk() tea.Cmd {
 		defer cancel()
 		objs, err := dock.SystemDiskUsage(ctx)
 		return diskLoadedMsg{msgTag: t, objs: objs, err: err}
+	}
+}
+
+func (d *Dashboard) probeShell(req containerReq) tea.Cmd {
+	dock := d.dock
+	t := msgTag{hostID: d.hostID, gen: d.gen}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		err := dock.ProbeShell(ctx, req.id)
+		return shellProbeDoneMsg{msgTag: t, req: req, err: err}
 	}
 }
 
@@ -230,6 +251,20 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			d.diskErr = ""
 		}
 		return d, nil
+
+	case shellExitedMsg:
+		if msg.err != nil {
+			detail := msg.detail
+			if detail == "" {
+				detail = msg.err.Error()
+			}
+			d.toast = "shell " + msg.name + " failed: " + detail
+			d.toastIsErr = true
+		} else {
+			d.toast = "shell " + msg.name + " ended"
+			d.toastIsErr = false
+		}
+		return d, d.fetchNow()
 
 	case tea.KeyMsg:
 		if d.detail != nil {
@@ -348,6 +383,16 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 					d.confirm = "rm"
 				} else {
 					d.toast = "only stopped containers can be removed"
+					d.toastIsErr = true
+				}
+			}
+			return d, nil
+		case "e":
+			if c, ok := d.selected(); ok {
+				if c.State == "running" {
+					d.shellReq = &containerReq{id: c.ID, name: c.ShortName()}
+				} else {
+					d.toast = "shell needs a running container"
 					d.toastIsErr = true
 				}
 			}
@@ -569,7 +614,7 @@ func (d *Dashboard) View() string {
 	if d.disconnected {
 		b.WriteString(helpLine("c", "reconnect", "esc", "back") + "\n")
 	} else {
-		b.WriteString(helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "i", "disk", "f", "refresh", "esc", "back") + "\n")
+		b.WriteString(helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back") + "\n")
 	}
 	return b.String()
 }
