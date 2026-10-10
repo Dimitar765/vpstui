@@ -12,6 +12,10 @@ var (
 	styleBanner = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 )
 
+func lipglossActiveTab() lipgloss.Style {
+	return lipgloss.NewStyle().Bold(true).Reverse(true).Padding(0, 1)
+}
+
 func helpLine(pairs ...string) string {
 	var b []string
 	for i := 0; i+1 < len(pairs); i += 2 {

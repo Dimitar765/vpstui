@@ -72,6 +72,18 @@ type logEndMsg struct {
 	err error
 }
 
+// Session is one live (or dialing) connection to a host. Only the active
+// session's dashboard ticks; background sessions pause but keep buffering
+// log chunks.
+type Session struct {
+	host models.Host
+	gen  uint64
+	conn *sshclient.Conn
+	dock *docker.Executor
+	dash *Dashboard
+	cv   *ContainerView
+}
+
 type Model struct {
 	hosts []models.Host
 	view  View
@@ -85,14 +97,12 @@ type Model struct {
 
 	sp spinner.Model
 
+	sessions []*Session
+	active   int
+
 	pendingHost models.Host
 	pendingGen  uint64
 	genSeq      uint64
-
-	conn *sshclient.Conn
-	dock *docker.Executor
-	dash *Dashboard
-	cv   *ContainerView
 
 	send     func(tea.Msg)
 	quitting bool
@@ -100,9 +110,10 @@ type Model struct {
 
 func New(hosts []models.Host) *Model {
 	m := &Model{
-		hosts: hosts,
-		view:  viewHosts,
-		sp:    spinner.New(spinner.WithSpinner(spinner.Dot)),
+		hosts:  hosts,
+		view:   viewHosts,
+		active: -1,
+		sp:     spinner.New(spinner.WithSpinner(spinner.Dot)),
 	}
 	m.list = NewHostList(hosts)
 	return m
@@ -113,6 +124,65 @@ func (m *Model) Attach(send func(tea.Msg)) { m.send = send }
 
 func (m *Model) Init() tea.Cmd { return m.sp.Tick }
 
+func (m *Model) nextGen() uint64 {
+	m.genSeq++
+	return m.genSeq
+}
+
+func (m *Model) findSession(hostID string, gen uint64) *Session {
+	for _, s := range m.sessions {
+		if s.host.ID == hostID && s.gen == gen {
+			return s
+		}
+	}
+	return nil
+}
+
+func (m *Model) findSessionByHost(hostID string) *Session {
+	for _, s := range m.sessions {
+		if s.host.ID == hostID {
+			return s
+		}
+	}
+	return nil
+}
+
+func (m *Model) indexOf(s *Session) int {
+	for i, x := range m.sessions {
+		if x == s {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *Model) activeSession() *Session {
+	if m.active < 0 || m.active >= len(m.sessions) {
+		return nil
+	}
+	return m.sessions[m.active]
+}
+
+func (m *Model) removeSession(s *Session) {
+	if idx := m.indexOf(s); idx >= 0 {
+		m.sessions = append(m.sessions[:idx], m.sessions[idx+1:]...)
+		if m.active >= len(m.sessions) {
+			m.active = len(m.sessions) - 1
+		}
+	}
+	m.refreshConnected()
+}
+
+func (m *Model) refreshConnected() {
+	ids := make([]string, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		if s.conn != nil {
+			ids = append(ids, s.host.ID)
+		}
+	}
+	m.list.SetConnected(ids)
+}
+
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -121,11 +191,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.form != nil {
 			m.form.SetSize(msg.Width)
 		}
-		if m.dash != nil {
-			m.dash.SetSize(msg.Width, msg.Height)
-		}
-		if m.cv != nil {
-			m.cv.SetSize(msg.Width, msg.Height)
+		for _, s := range m.sessions {
+			if s.dash != nil {
+				s.dash.SetSize(msg.Width, msg.Height)
+			}
+			if s.cv != nil {
+				s.cv.SetSize(msg.Width, msg.Height)
+			}
 		}
 		return m, nil
 
@@ -143,7 +215,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.route(msg)
 
 	case connectHostReq:
-		return m.startConnect(msg.host)
+		return m.openOrConnect(msg.host)
 
 	case newHostReq:
 		m.form = NewHostForm(models.Host{}, true)
@@ -211,7 +283,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				_ = secret.Set(ref, s)
 			}
-			return m.connectWithSecret(h, s)
+			return m, m.dialCmd(h, m.pendingGen, s)
 		}
 		if cancelled {
 			m.form = nil
@@ -220,81 +292,192 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
-	case viewDashboard:
-		dash, cmd := m.dash.Update(msg)
-		m.dash = dash
-		if m.dash.TakeReconnect() {
-			h := m.dash.host
-			m.conn.Close()
-			m.conn = nil
-			m.dock = nil
-			m.dash = nil
-			m.cv = nil
-			return m.startConnect(h)
-		}
-		if m.dash.GoBack() {
-			m.conn.Close()
-			m.conn = nil
-			m.dock = nil
-			m.dash = nil
+	case viewConnecting:
+		// esc keeps the dial running in the background
+		if msg.String() == "esc" {
 			m.view = viewHosts
-			m.status = ""
+		}
+		return m, nil
+
+	case viewDashboard:
+		if handled, cmd := m.sessionKeys(msg.String()); handled {
+			return m, cmd
+		}
+		s := m.activeSession()
+		if s == nil || s.dash == nil {
 			return m, nil
 		}
-		if req, ok := m.dash.OpenLogs(); ok {
-			m.cv = NewContainerView(req.id, req.name, m.width, m.height)
-			m.cv.hostID = m.dash.hostID
-			m.cv.gen = m.dash.gen
+		dash, cmd := s.dash.Update(msg)
+		s.dash = dash
+		if s.dash.TakeReconnect() {
+			return m.reconnect(s)
+		}
+		if s.dash.TakeBack() {
+			m.view = viewHosts
+			return m, nil
+		}
+		if req, ok := s.dash.OpenLogs(); ok {
+			s.cv = NewContainerView(req.id, req.name, m.width, m.height)
+			s.cv.hostID = s.dash.hostID
+			s.cv.gen = s.dash.gen
 			m.view = viewContainer
-			return m, m.startLogStream(m.cv, req.id)
+			return m, startLogStream(s, req.id, m.send)
 		}
 		return m, cmd
 
 	case viewContainer:
+		if handled, cmd := m.sessionKeys(msg.String()); handled {
+			return m, cmd
+		}
 		key := msg.String()
+		s := m.activeSession()
 		if key == "esc" || key == "q" {
-			m.cv.Stop()
-			m.cv = nil
+			if s != nil && s.cv != nil {
+				s.cv.Stop()
+				s.cv = nil
+			}
 			m.view = viewDashboard
-			return m, tea.Batch(m.dash.fetchNow(), tickStats(m.dash.hostID, m.dash.gen))
+			if s != nil && s.dash != nil {
+				return m, tea.Batch(s.dash.fetchNow(), tickStats(s.host.ID, s.gen))
+			}
+			return m, nil
 		}
 		var cmd tea.Cmd
-		m.cv, cmd = m.cv.Update(msg)
+		if s != nil && s.cv != nil {
+			s.cv, cmd = s.cv.Update(msg)
+		}
 		return m, cmd
 	}
 	return m, nil
 }
 
+// sessionKeys handles multi-session navigation from dashboard/log views.
+func (m *Model) sessionKeys(key string) (bool, tea.Cmd) {
+	if len(m.sessions) == 0 {
+		return false, nil
+	}
+	switch key {
+	case "tab":
+		m.activate((m.active + 1) % len(m.sessions))
+		return true, nil
+	case "shift+tab":
+		m.activate((m.active - 1 + len(m.sessions)) % len(m.sessions))
+		return true, nil
+	case "X":
+		return true, m.closeActive()
+	}
+	if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
+		i := int(key[0] - '1')
+		if i < len(m.sessions) {
+			m.activate(i)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Model) activate(i int) tea.Cmd {
+	m.active = i
+	s := m.sessions[i]
+	if s.dash == nil {
+		m.pendingHost, m.pendingGen = s.host, s.gen
+		m.view = viewConnecting
+		return nil
+	}
+	m.view = viewDashboard
+	return tea.Batch(s.dash.fetchNow(), tickStats(s.host.ID, s.gen))
+}
+
+func (m *Model) closeActive() tea.Cmd {
+	s := m.activeSession()
+	if s == nil {
+		return nil
+	}
+	if s.cv != nil {
+		s.cv.Stop()
+	}
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	m.removeSession(s)
+	if len(m.sessions) == 0 {
+		m.active = -1
+		m.view = viewHosts
+		return nil
+	}
+	return m.activate(m.active)
+}
+
+func (m *Model) reconnect(s *Session) (tea.Model, tea.Cmd) {
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	s.conn, s.dock, s.dash = nil, nil, nil
+	if s.cv != nil {
+		s.cv.Stop()
+		s.cv = nil
+	}
+	s.gen = m.nextGen()
+	m.pendingHost, m.pendingGen = s.host, s.gen
+	m.view = viewConnecting
+	m.refreshConnected()
+	return m.connectSlot(s)
+}
+
+func (m *Model) openOrConnect(h models.Host) (tea.Model, tea.Cmd) {
+	if s := m.findSessionByHost(h.ID); s != nil {
+		m.activate(m.indexOf(s))
+		return m, nil
+	}
+	return m.startConnect(h)
+}
+
 func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var t msgTag
 	switch msg := msg.(type) {
 	case statsTickMsg:
-		if m.view == viewDashboard && m.dash.tag(msg.hostID, msg.gen) {
-			m.dash, _ = m.dash.Update(msg)
-			return m, tea.Batch(m.dash.fetchNow(), tickStats(msg.hostID, msg.gen))
-		}
-		return m, nil
+		t = msg.msgTag
 	case statsLoadedMsg:
-		if m.view == viewDashboard && m.dash.tag(msg.hostID, msg.gen) {
-			dash, cmd := m.dash.Update(msg)
-			m.dash = dash
-			return m, cmd
+		t = msg.msgTag
+	case actionDoneMsg:
+		t = msg.msgTag
+	case logChunkMsg:
+		t = msg.msgTag
+	case logEndMsg:
+		t = msg.msgTag
+	}
+	s := m.findSession(t.hostID, t.gen)
+	if s == nil {
+		return m, nil // stale
+	}
+	switch msg := msg.(type) {
+	case statsTickMsg:
+		if m.view == viewDashboard && m.activeSession() == s && s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
+			return m, tea.Batch(s.dash.fetchNow(), tickStats(t.hostID, t.gen))
+		}
+		return m, nil // chain stops while not viewing
+	case statsLoadedMsg:
+		if s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
 		}
 		return m, nil
 	case actionDoneMsg:
-		if m.view == viewDashboard && m.dash.tag(msg.hostID, msg.gen) {
-			dash, cmd := m.dash.Update(msg)
-			m.dash = dash
-			return m, cmd
+		if s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
+			if m.view == viewDashboard && m.activeSession() == s {
+				return m, s.dash.fetchNow()
+			}
 		}
 		return m, nil
 	case logChunkMsg:
-		if m.view == viewContainer && m.cv.tag(msg.hostID, msg.gen) {
-			m.cv.Append(msg.chunk)
+		if s.cv != nil {
+			s.cv.Append(msg.chunk)
 		}
 		return m, nil
 	case logEndMsg:
-		if m.view == viewContainer && m.cv.tag(msg.hostID, msg.gen) {
-			m.cv.StreamDone(msg.err)
+		if s.cv != nil {
+			s.cv.StreamDone(msg.err)
 		}
 		return m, nil
 	}
@@ -309,9 +492,13 @@ func (m *Model) routeInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case viewForm, viewPrompt:
 		m.form, _, _, _ = m.form.Update(msg)
 	case viewDashboard:
-		m.dash, cmd = m.dash.Update(msg)
+		if s := m.activeSession(); s != nil && s.dash != nil {
+			s.dash, cmd = s.dash.Update(msg)
+		}
 	case viewContainer:
-		m.cv, cmd = m.cv.Update(msg)
+		if s := m.activeSession(); s != nil && s.cv != nil {
+			s.cv, cmd = s.cv.Update(msg)
+		}
 	}
 	return m, cmd
 }
@@ -325,34 +512,80 @@ func (m *Model) View() string {
 		out := styleTitle.Render("vpstui — VPS & containers over SSH") + "\n\n" + m.list.View()
 		if m.status != "" {
 			out += "\n" + styleWarn.Render(m.status)
+			m.status = ""
 		}
-		out += "\n" + helpLine("n", "new", "e", "edit", "d", "delete", "enter", "connect", "q", "quit")
+		out += "\n" + helpLine("n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit")
 		return out
-	case viewForm:
-		return m.form.View(m.width)
-	case viewPrompt:
+	case viewForm, viewPrompt:
 		return m.form.View(m.width)
 	case viewConnecting:
-		return "\n" + m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…"
+		return m.tabBar() + "\n" + m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…" +
+			styleMuted.Render("  (esc: keep dialing in background)")
 	case viewDashboard:
-		return m.dash.View()
+		if s := m.activeSession(); s != nil && s.dash != nil {
+			return m.tabBar() + "\n" + s.dash.View()
+		}
+		return m.tabBar()
 	case viewContainer:
-		return m.cv.View()
+		if s := m.activeSession(); s != nil && s.cv != nil {
+			return m.tabBar() + "\n" + s.cv.View()
+		}
+		return m.tabBar()
 	}
 	return ""
 }
 
+func (m *Model) tabBar() string {
+	if len(m.sessions) == 0 {
+		return ""
+	}
+	var parts []string
+	for i, s := range m.sessions {
+		mark := "○"
+		if s.conn != nil {
+			mark = "●"
+		}
+		label := fmt.Sprintf("%d %s %s", i+1, s.host.Name, mark)
+		if i == m.active {
+			parts = append(parts, lipglossActiveTab().Render(label))
+		} else {
+			parts = append(parts, styleMuted.Render(label))
+		}
+	}
+	return strings.Join(parts, "  ")
+}
+
 func (m *Model) cleanup() {
-	if m.cv != nil {
-		m.cv.Stop()
+	for _, s := range m.sessions {
+		if s.cv != nil {
+			s.cv.Stop()
+		}
+		if s.conn != nil {
+			s.conn.Close()
+		}
 	}
-	if m.conn != nil {
-		m.conn.Close()
-	}
+	m.sessions = nil
+	m.active = -1
 	m.quitting = true
 }
 
 func (m *Model) deleteHost(h models.Host) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	if s := m.findSessionByHost(h.ID); s != nil {
+		if s.cv != nil {
+			s.cv.Stop()
+		}
+		if s.conn != nil {
+			s.conn.Close()
+		}
+		wasActive := m.indexOf(s) == m.active
+		m.removeSession(s)
+		if len(m.sessions) == 0 {
+			m.active = -1
+		} else if wasActive {
+			cmd = m.activate(m.active)
+		}
+	}
 	out := m.hosts[:0]
 	for _, x := range m.hosts {
 		if x.ID != h.ID {
@@ -366,7 +599,8 @@ func (m *Model) deleteHost(h models.Host) (tea.Model, tea.Cmd) {
 		m.status = "could not save hosts: " + err.Error()
 	}
 	m.list.SetItems(m.hosts)
-	return m, nil
+	m.refreshConnected()
+	return m, cmd
 }
 
 func (m *Model) saveHost(msg formSubmittedMsg) (tea.Model, tea.Cmd) {
@@ -397,28 +631,33 @@ func (m *Model) saveHost(msg formSubmittedMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) nextGen() uint64 {
-	m.genSeq++
-	return m.genSeq
+func (m *Model) startConnect(h models.Host) (tea.Model, tea.Cmd) {
+	s := &Session{host: h, gen: m.nextGen()}
+	m.sessions = append(m.sessions, s)
+	return m.connectSlot(s)
 }
 
-func (m *Model) startConnect(h models.Host) (tea.Model, tea.Cmd) {
-	m.pendingHost = h
-	m.pendingGen = m.nextGen()
-	switch h.AuthType {
+func (m *Model) connectSlot(s *Session) (tea.Model, tea.Cmd) {
+	m.active = m.indexOf(s)
+	m.pendingHost, m.pendingGen = s.host, s.gen
+	switch s.host.AuthType {
 	case models.AuthAgent:
-		return m.connectWithSecret(h, "")
+		m.view = viewConnecting
+		return m, m.dialCmd(s.host, s.gen, "")
 	case models.AuthPassword:
-		s, err := secret.Get(h.PasswordRef())
-		if err != nil || s == "" {
-			return m.openPrompt(h, "Password for "+h.User+"@"+h.Address)
+		pw, err := secret.Get(s.host.PasswordRef())
+		if err != nil || pw == "" {
+			return m.openPrompt(s.host, "Password for "+s.host.User+"@"+s.host.Address)
 		}
-		return m.connectWithSecret(h, s)
+		m.view = viewConnecting
+		return m, m.dialCmd(s.host, s.gen, pw)
 	case models.AuthKey:
-		s, _ := secret.Get(h.PassphraseRef())
-		return m.connectWithSecret(h, s)
+		pass, _ := secret.Get(s.host.PassphraseRef())
+		m.view = viewConnecting
+		return m, m.dialCmd(s.host, s.gen, pass)
 	}
 	m.status = "unknown auth type for host"
+	m.removeSession(s)
 	return m, nil
 }
 
@@ -428,12 +667,9 @@ func (m *Model) openPrompt(h models.Host, label string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) connectWithSecret(h models.Host, s string) (tea.Model, tea.Cmd) {
-	m.pendingHost = h
-	m.view = viewConnecting
-	gen := m.pendingGen
+func (m *Model) dialCmd(h models.Host, gen uint64, s string) tea.Cmd {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	return m, func() tea.Msg {
+	return func() tea.Msg {
 		defer cancel()
 		t := msgTag{hostID: h.ID, gen: gen}
 		conn, err := sshclient.Dial(ctx, h, s)
@@ -445,51 +681,58 @@ func (m *Model) connectWithSecret(h models.Host, s string) (tea.Model, tea.Cmd) 
 }
 
 func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
-	if m.view != viewConnecting {
+	s := m.findSession(msg.hostID, msg.gen)
+	if s == nil {
 		if msg.conn != nil {
 			msg.conn.Close()
 		}
 		return m, nil
 	}
+	es := ""
 	if msg.err != nil {
-		if msg.gen != m.pendingGen {
+		es = msg.err.Error()
+	}
+	if msg.err != nil {
+		foreground := m.view == viewConnecting && m.pendingGen == msg.gen
+		m.removeSession(s)
+		if foreground {
+			m.view = viewHosts
+			if strings.Contains(es, "passphrase-protected") || strings.Contains(es, "no password provided") {
+				s := &Session{host: msg.host, gen: m.nextGen()}
+				m.sessions = append(m.sessions, s)
+				m.active = m.indexOf(s)
+				label := "Password for "
+				if strings.Contains(es, "passphrase") {
+					label = "Key passphrase for "
+				}
+				return m.openPrompt(msg.host, label+msg.host.User+"@"+msg.host.Address)
+			}
+			m.status = "connect failed: " + es
 			return m, nil
 		}
-		m.conn = nil
-		m.view = viewHosts
-		es := msg.err.Error()
-		if strings.Contains(es, "passphrase-protected") {
-			return m.openPrompt(msg.host, "Key passphrase for "+msg.host.User+"@"+msg.host.Address)
-		}
-		if strings.Contains(es, "no password provided") {
-			return m.openPrompt(msg.host, "Password for "+msg.host.User+"@"+msg.host.Address)
-		}
-		m.status = "connect failed: " + es
+		m.status = "connect " + msg.host.Name + " failed: " + es
 		return m, nil
 	}
-	if msg.gen != m.pendingGen {
-		msg.conn.Close()
-		return m, nil
+	s.conn = msg.conn
+	s.dock = docker.New(msg.conn)
+	s.dash = NewDashboard(msg.host, s.dock, m.width, m.height, msg.gen)
+	m.refreshConnected()
+	if m.view == viewConnecting && m.pendingGen == msg.gen {
+		m.view = viewDashboard
+		m.active = m.indexOf(s)
 	}
-	m.conn = msg.conn
-	m.dock = docker.New(msg.conn)
-	m.dash = NewDashboard(msg.host, m.dock, m.width, m.height, msg.gen)
-	m.view = viewDashboard
-	return m, tea.Batch(m.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
+	return m, tea.Batch(s.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
 }
 
-func (m *Model) startLogStream(cv *ContainerView, id string) tea.Cmd {
-	dock := m.dock
-	send := m.send
-	t := msgTag{hostID: cv.hostID, gen: cv.gen}
+func startLogStream(s *Session, id string, send func(tea.Msg)) tea.Cmd {
+	dock := s.dock
+	t := msgTag{hostID: s.host.ID, gen: s.gen}
 	return func() tea.Msg {
-		r, err := cv.Open(dock, id)
+		r, err := s.cv.Open(dock, id)
 		if err != nil {
 			return logEndMsg{msgTag: t, err: err}
 		}
-		go func() {
-			streamLogs(r, send, t)
-		}()
+		go streamLogs(r, send, t)
 		return nil
 	}
 }

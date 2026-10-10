@@ -9,13 +9,20 @@ import (
 	"vpstui/internal/models"
 )
 
-type hostItem struct{ h models.Host }
+type hostItem struct {
+	h    models.Host
+	conn bool
+}
 
 func (i hostItem) Title() string {
-	if i.h.Name != "" {
-		return i.h.Name
+	t := i.h.Name
+	if t == "" {
+		t = i.h.Address
 	}
-	return i.h.Address
+	if i.conn {
+		t = styleOK.Render("●") + " " + t
+	}
+	return t
 }
 func (i hostItem) Description() string {
 	return fmt.Sprintf("%s@%s:%d · %s", i.h.User, i.h.Address, i.h.Port, i.h.AuthType)
@@ -25,10 +32,11 @@ func (i hostItem) FilterValue() string { return i.Title() }
 type HostList struct {
 	l     list.Model
 	hosts []models.Host
+	conn  map[string]bool
 }
 
 func NewHostList(hosts []models.Host) *HostList {
-	items := itemsFor(hosts)
+	items := itemsFor(hosts, nil)
 	l := list.New(items, list.NewDefaultDelegate(), 40, 12)
 	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
@@ -37,17 +45,26 @@ func NewHostList(hosts []models.Host) *HostList {
 	return &HostList{l: l, hosts: hosts}
 }
 
-func itemsFor(hosts []models.Host) []list.Item {
+func itemsFor(hosts []models.Host, conn map[string]bool) []list.Item {
 	items := make([]list.Item, 0, len(hosts))
 	for _, h := range hosts {
-		items = append(items, hostItem{h: h})
+		items = append(items, hostItem{h: h, conn: conn[h.ID]})
 	}
 	return items
 }
 
 func (l *HostList) SetItems(hosts []models.Host) {
 	l.hosts = hosts
-	_ = l.l.SetItems(itemsFor(hosts))
+	_ = l.l.SetItems(itemsFor(hosts, l.conn))
+}
+
+func (l *HostList) SetConnected(ids []string) {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	l.conn = set
+	_ = l.l.SetItems(itemsFor(l.hosts, set))
 }
 
 func (l *HostList) SetSize(w, h int) {

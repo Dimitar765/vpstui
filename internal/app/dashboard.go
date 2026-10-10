@@ -70,7 +70,11 @@ func (d *Dashboard) SetSize(w, h int) {
 	d.tbl.SetHeight(max(h-10, 3))
 }
 
-func (d *Dashboard) GoBack() bool { return d.back }
+func (d *Dashboard) TakeBack() bool {
+	b := d.back
+	d.back = false
+	return b
+}
 
 func (d *Dashboard) TakeReconnect() bool {
 	r := d.reconnect
