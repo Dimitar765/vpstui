@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,13 @@ type containerReq struct {
 	name string
 }
 
+type detailState struct {
+	name    string
+	loading bool
+	text    string
+	isErr   bool
+}
+
 type Dashboard struct {
 	host models.Host
 	dock *docker.Executor
@@ -30,6 +38,12 @@ type Dashboard struct {
 	stats        map[string]models.ContainerStats // by container name
 	hstats       models.HostStats
 	hasHostStats bool
+
+	collapsed map[string]bool // compose project → folded
+	rowCIdx   []int           // table row → containers index, -1 for group headers
+	rowProj   []string        // table row → compose project, "" for standalone
+
+	detail *detailState
 
 	errMsg       string
 	toast        string
@@ -54,8 +68,9 @@ var tableColumns = []table.Column{
 }
 
 func NewDashboard(host models.Host, dock *docker.Executor, w, h int, gen uint64) *Dashboard {
-	d := &Dashboard{host: host, dock: dock, hostID: host.ID, gen: gen, stats: map[string]models.ContainerStats{}, width: w, height: h}
+	d := &Dashboard{host: host, dock: dock, hostID: host.ID, gen: gen, stats: map[string]models.ContainerStats{}, collapsed: map[string]bool{}, width: w, height: h}
 	t := table.New(table.WithColumns(tableColumns), table.WithWidth(max(w-2, 20)))
+	t.Focus()
 	d.tbl = t
 	return d
 }
@@ -93,10 +108,24 @@ func (d *Dashboard) OpenLogs() (containerReq, bool) {
 
 func (d *Dashboard) selected() (models.Container, bool) {
 	idx := d.tbl.Cursor()
-	if idx < 0 || idx >= len(d.containers) {
+	if idx < 0 || idx >= len(d.rowCIdx) {
 		return models.Container{}, false
 	}
-	return d.containers[idx], true
+	ci := d.rowCIdx[idx]
+	if ci < 0 {
+		return models.Container{}, false
+	}
+	return d.containers[ci], true
+}
+
+// selectedProject returns the compose project of the row under the cursor,
+// "" for standalone rows, false when out of range.
+func (d *Dashboard) selectedProject() (string, bool) {
+	idx := d.tbl.Cursor()
+	if idx < 0 || idx >= len(d.rowProj) {
+		return "", false
+	}
+	return d.rowProj[idx], true
 }
 
 func (d *Dashboard) fetchNow() tea.Cmd {
@@ -155,7 +184,28 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		d.errMsg = ""
 		return d, d.fetchNow()
 
+	case detailLoadedMsg:
+		if d.detail == nil {
+			return d, nil
+		}
+		if msg.err != nil {
+			d.detail.text = msg.err.Error()
+			d.detail.isErr = true
+		} else {
+			d.detail.text = detailText(msg.detail)
+			d.detail.isErr = false
+		}
+		d.detail.loading = false
+		return d, nil
+
 	case tea.KeyMsg:
+		if d.detail != nil {
+			switch msg.String() {
+			case "esc", "q", "d", "x", "enter":
+				d.detail = nil
+			}
+			return d, nil
+		}
 		if d.confirm != "" {
 			switch msg.String() {
 			case "y", "Y":
@@ -188,6 +238,10 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 				d.confirm = ""
 			}
 		}
+		if k := msg.String(); k == " " || k == "space" {
+			d.toggleFold()
+			return d, nil
+		}
 		switch msg.String() {
 		case "c":
 			if d.disconnected {
@@ -219,6 +273,20 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 				d.confirm = "restart"
 			}
 			return d, nil
+		case "d":
+			if c, ok := d.selected(); ok {
+				d.detail = &detailState{name: c.ShortName(), loading: true}
+				dock := d.dock
+				t := msgTag{hostID: d.hostID, gen: d.gen}
+				id := c.ID
+				return d, func() tea.Msg {
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					det, err := dock.Inspect(ctx, id)
+					return detailLoadedMsg{msgTag: t, detail: det, err: err}
+				}
+			}
+			return d, nil
 		}
 	}
 
@@ -238,15 +306,117 @@ func looksLikeConnLoss(s string) bool {
 }
 
 func (d *Dashboard) rebuild() {
-	rows := make([]table.Row, 0, len(d.containers))
-	for _, c := range d.containers {
-		cpu, mem, memUsage := "-", "-", "-"
-		if s, ok := d.stats[c.ShortName()]; ok {
-			cpu, mem, memUsage = s.CPUPerc, s.MemPerc, s.MemUsage
+	cur := d.tbl.Cursor()
+
+	byProj := map[string][]int{}
+	var order []string
+	for i, c := range d.containers {
+		p := c.ComposeProject()
+		if _, ok := byProj[p]; !ok {
+			order = append(order, p)
 		}
-		rows = append(rows, table.Row{c.ShortName(), c.Image, c.State, c.Status, cpu, mem, memUsage})
+		byProj[p] = append(byProj[p], i)
 	}
+	sort.SliceStable(order, func(i, k int) bool {
+		if (order[i] == "") != (order[k] == "") {
+			return order[i] == ""
+		}
+		return order[i] < order[k]
+	})
+
+	rows := make([]table.Row, 0, len(d.containers))
+	d.rowCIdx = d.rowCIdx[:0]
+	d.rowProj = d.rowProj[:0]
+	blank := func() table.Row { return table.Row{"", "", "", "", "", "", ""} }
+
+	for _, p := range order {
+		idxs := byProj[p]
+		if p == "" {
+			for _, i := range idxs {
+				rows = append(rows, d.containerRow(d.containers[i]))
+				d.rowCIdx = append(d.rowCIdx, i)
+				d.rowProj = append(d.rowProj, "")
+			}
+			continue
+		}
+		folded := d.collapsed[p]
+		marker := "▾"
+		if folded {
+			marker = "▸"
+		}
+		hdr := blank()
+		hdr[0] = fmt.Sprintf("%s compose:%s (%d)", marker, p, len(idxs))
+		rows = append(rows, hdr)
+		d.rowCIdx = append(d.rowCIdx, -1)
+		d.rowProj = append(d.rowProj, p)
+		if folded {
+			continue
+		}
+		for _, i := range idxs {
+			rows = append(rows, d.containerRow(d.containers[i]))
+			d.rowCIdx = append(d.rowCIdx, i)
+			d.rowProj = append(d.rowProj, p)
+		}
+	}
+
 	d.tbl.SetRows(rows)
+	if cur >= len(rows) {
+		cur = len(rows) - 1
+	}
+	if cur < 0 {
+		cur = 0
+	}
+	if len(rows) > 0 {
+		d.tbl.SetCursor(cur)
+	}
+}
+
+func (d *Dashboard) containerRow(c models.Container) table.Row {
+	cpu, mem, memUsage := "-", "-", "-"
+	if s, ok := d.stats[c.ShortName()]; ok {
+		cpu, mem, memUsage = s.CPUPerc, s.MemPerc, s.MemUsage
+	}
+	return table.Row{c.ShortName(), c.Image, c.State, c.Status, cpu, mem, memUsage}
+}
+
+func (d *Dashboard) toggleFold() {
+	p, ok := d.selectedProject()
+	if !ok || p == "" {
+		return
+	}
+	d.collapsed[p] = !d.collapsed[p]
+	d.rebuild()
+}
+
+func detailText(det models.ContainerDetail) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "status: %s · restarts: %d · created: %s\n", det.Status, det.RestartCount, det.Created)
+	fmt.Fprintf(&b, "image:  %s\n", det.Image)
+	if len(det.Networks) == 0 {
+		b.WriteString("networks: none\n")
+	} else {
+		b.WriteString("networks:\n")
+		for _, n := range det.Networks {
+			fmt.Fprintf(&b, "  %s  %s\n", n.Name, n.IPAddress)
+		}
+	}
+	if len(det.Ports) == 0 {
+		b.WriteString("ports: none\n")
+	} else {
+		b.WriteString("ports:\n")
+		for _, p := range det.Ports {
+			b.WriteString("  " + p + "\n")
+		}
+	}
+	if len(det.Mounts) == 0 {
+		b.WriteString("mounts: none\n")
+	} else {
+		b.WriteString("mounts:\n")
+		for _, m := range det.Mounts {
+			b.WriteString("  " + m + "\n")
+		}
+	}
+	return b.String()
 }
 
 func (d *Dashboard) View() string {
@@ -280,6 +450,18 @@ func (d *Dashboard) View() string {
 		b.WriteString(styleErr.Render(d.errMsg) + "\n")
 	}
 	b.WriteString("\n")
+	if d.detail != nil {
+		b.WriteString(styleTitle.Render("detail — "+d.detail.name) + "\n")
+		if d.detail.loading {
+			b.WriteString(styleMuted.Render("inspecting…") + "\n")
+		} else if d.detail.isErr {
+			b.WriteString(styleErr.Render(d.detail.text) + "\n")
+		} else {
+			b.WriteString(d.detail.text)
+		}
+		b.WriteString(helpLine("esc", "close", "d", "close", "f", "refresh") + "\n")
+		return b.String()
+	}
 	if len(d.containers) == 0 && d.errMsg == "" && !d.disconnected {
 		b.WriteString(styleMuted.Render("no containers found on this host") + "\n")
 	}
@@ -287,7 +469,7 @@ func (d *Dashboard) View() string {
 	if d.disconnected {
 		b.WriteString(helpLine("c", "reconnect", "esc", "back") + "\n")
 	} else {
-		b.WriteString(helpLine("enter", "logs", "s", "start", "x", "stop", "r", "restart", "f", "refresh", "esc", "back") + "\n")
+		b.WriteString(helpLine("enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "f", "refresh", "esc", "back") + "\n")
 	}
 	return b.String()
 }

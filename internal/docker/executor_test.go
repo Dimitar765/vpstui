@@ -248,3 +248,55 @@ func TestParseHostStats(t *testing.T) {
 		})
 	}
 }
+
+func TestParseInspect(t *testing.T) {
+	const sample = `[{
+      "Id": "abc123",
+      "Name": "/web-1",
+      "Created": "2026-10-01T12:00:00.0Z",
+      "Config": {"Image": "nginx:alpine"},
+      "State": {"Status": "running", "RestartCount": 3},
+      "Mounts": [
+        {"Type": "bind", "Source": "/srv/www", "Destination": "/usr/share/nginx/html", "RW": false},
+        {"Type": "volume", "Source": "www_data", "Destination": "/var/cache", "RW": true}
+      ],
+      "NetworkSettings": {
+        "Networks": {
+          "web_default": {"IPAddress": "172.20.0.5"},
+          "no_ip_net":   {"IPAddress": ""}
+        },
+        "Ports": {
+          "443/tcp": null,
+          "80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}]
+        }
+      }
+    }]`
+	d, err := parseInspect(sample)
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if d.Name != "web-1" || d.Image != "nginx:alpine" || d.Status != "running" || d.RestartCount != 3 {
+		t.Errorf("scalar fields: %+v", d)
+	}
+	if len(d.Networks) != 1 || d.Networks[0].Name != "web_default" || d.Networks[0].IPAddress != "172.20.0.5" {
+		t.Errorf("networks = %+v, want only web_default", d.Networks)
+	}
+	wantPorts := []string{"443/tcp -> (not published)", "80/tcp -> 0.0.0.0:8080"}
+	if len(d.Ports) != 2 || d.Ports[0] != wantPorts[0] || d.Ports[1] != wantPorts[1] {
+		t.Errorf("ports = %v, want %v (sorted)", d.Ports, wantPorts)
+	}
+	if len(d.Mounts) != 2 || d.Mounts[0] != "bind: /srv/www -> /usr/share/nginx/html (ro)" {
+		t.Errorf("mounts = %v", d.Mounts)
+	}
+	if d.Mounts[1] != "volume: www_data -> /var/cache (rw)" {
+		t.Errorf("mounts[1] = %q", d.Mounts[1])
+	}
+}
+
+func TestParseInspectMalformed(t *testing.T) {
+	for _, in := range []string{"", "[]", "not json", "{}"} {
+		if _, err := parseInspect(in); err == nil {
+			t.Errorf("parseInspect(%q) expected error", in)
+		}
+	}
+}

@@ -108,3 +108,27 @@ func TestHostFormatting(t *testing.T) {
 		})
 	}
 }
+
+func TestComposeProject(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels string
+		want   string
+	}{
+		{"empty", "", ""},
+		{"single label unrelated", "maintainer=x", ""},
+		{"compose project", "com.docker.compose.project=monitoring", "monitoring"},
+		{"compose project mid-list", "a=1,com.docker.compose.project=web,b=2", "web"},
+		{"compose project last", "a=1,com.docker.compose.project=stack", "stack"},
+		{"similar key is not matched", "x.com.docker.compose.project=nope", ""},
+		{"empty value", "com.docker.compose.project=", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Container{Labels: tt.labels}
+			if got := c.ComposeProject(); got != tt.want {
+				t.Errorf("ComposeProject(%q) = %q, want %q", tt.labels, got, tt.want)
+			}
+		})
+	}
+}

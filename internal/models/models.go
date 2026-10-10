@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -46,10 +47,39 @@ type Container struct {
 	State     string
 	Status    string
 	CreatedAt string
+	Labels    string
 }
 
 func (c Container) ShortName() string {
 	return firstName(c.Names)
+}
+
+// ComposeProject returns the value of the com.docker.compose.project label,
+// or "" for standalone containers.
+func (c Container) ComposeProject() string {
+	const key = "com.docker.compose.project="
+	for _, pair := range strings.Split(c.Labels, ",") {
+		if v, ok := strings.CutPrefix(pair, key); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+type ContainerDetail struct {
+	Name         string
+	Image        string
+	Status       string
+	Created      string
+	RestartCount int
+	Networks     []NetworkAddr // sorted by name
+	Ports        []string      // "80/tcp -> 0.0.0.0:8080"
+	Mounts       []string      // "bind: /host -> /ctr (rw)"
+}
+
+type NetworkAddr struct {
+	Name      string
+	IPAddress string
 }
 
 func firstName(names string) string {

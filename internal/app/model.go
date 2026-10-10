@@ -71,6 +71,11 @@ type logEndMsg struct {
 	msgTag
 	err error
 }
+type detailLoadedMsg struct {
+	msgTag
+	detail models.ContainerDetail
+	err    error
+}
 
 // Session is one live (or dialing) connection to a host. Only the active
 // session's dashboard ticks; background sessions pause but keep buffering
@@ -214,7 +219,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg:
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, detailLoadedMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -448,6 +453,8 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case logEndMsg:
 		t = msg.msgTag
+	case detailLoadedMsg:
+		t = msg.msgTag
 	}
 	s := m.findSession(t.hostID, t.gen)
 	if s == nil {
@@ -481,6 +488,11 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logEndMsg:
 		if s.cv != nil {
 			s.cv.StreamDone(msg.err)
+		}
+		return m, nil
+	case detailLoadedMsg:
+		if s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
 		}
 		return m, nil
 	}

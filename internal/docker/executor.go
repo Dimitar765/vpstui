@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,7 @@ type psJSON struct {
 	State     string `json:"State"`
 	Status    string `json:"Status"`
 	CreatedAt string `json:"CreatedAt"`
+	Labels    string `json:"Labels"`
 }
 
 func (e *Executor) ListContainers(ctx context.Context) ([]models.Container, error) {
@@ -82,6 +84,7 @@ func (e *Executor) ListContainers(ctx context.Context) ([]models.Container, erro
 		res = append(res, models.Container{
 			ID: j.ID, Names: j.Names, Image: j.Image,
 			State: j.State, Status: j.Status, CreatedAt: j.CreatedAt,
+			Labels: j.Labels,
 		})
 	}
 	return res, nil
@@ -184,4 +187,84 @@ func (e *Executor) Restart(ctx context.Context, id string) error {
 
 func (e *Executor) StreamLogs(ctx context.Context, id string) (io.ReadCloser, error) {
 	return e.conn.StreamExec(ctx, "docker logs -f --tail 200 "+quote(id))
+}
+
+func (e *Executor) Inspect(ctx context.Context, id string) (models.ContainerDetail, error) {
+	out, err := e.exec(ctx, 15*time.Second, "docker inspect "+quote(id))
+	if err != nil {
+		return models.ContainerDetail{}, err
+	}
+	return parseInspect(out)
+}
+
+type inspectJSON struct {
+	Name    string
+	Created string
+	Config  struct {
+		Image string
+	}
+	State struct {
+		Status       string
+		RestartCount int
+	}
+	Mounts []struct {
+		Type        string
+		Source      string
+		Destination string
+		RW          bool
+	}
+	NetworkSettings struct {
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		}
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		}
+	}
+}
+
+func parseInspect(out string) (models.ContainerDetail, error) {
+	var arr []inspectJSON
+	if err := json.Unmarshal([]byte(out), &arr); err != nil || len(arr) == 0 {
+		return models.ContainerDetail{}, fmt.Errorf("could not parse docker inspect output")
+	}
+	j := arr[0]
+	d := models.ContainerDetail{
+		Name:         strings.TrimPrefix(j.Name, "/"),
+		Image:        j.Config.Image,
+		Status:       j.State.Status,
+		Created:      j.Created,
+		RestartCount: j.State.RestartCount,
+	}
+	for name, nw := range j.NetworkSettings.Networks {
+		if nw.IPAddress == "" {
+			continue
+		}
+		d.Networks = append(d.Networks, models.NetworkAddr{Name: name, IPAddress: nw.IPAddress})
+	}
+	sort.Slice(d.Networks, func(i, k int) bool { return d.Networks[i].Name < d.Networks[k].Name })
+	var portKeys []string
+	for p := range j.NetworkSettings.Ports {
+		portKeys = append(portKeys, p)
+	}
+	sort.Strings(portKeys)
+	for _, p := range portKeys {
+		binds := j.NetworkSettings.Ports[p]
+		if len(binds) == 0 {
+			d.Ports = append(d.Ports, p+" -> (not published)")
+			continue
+		}
+		for _, b := range binds {
+			d.Ports = append(d.Ports, p+" -> "+b.HostIP+":"+b.HostPort)
+		}
+	}
+	for _, m := range j.Mounts {
+		rw := "ro"
+		if m.RW {
+			rw = "rw"
+		}
+		d.Mounts = append(d.Mounts, fmt.Sprintf("%s: %s -> %s (%s)", strings.ToLower(m.Type), m.Source, m.Destination, rw))
+	}
+	return d, nil
 }

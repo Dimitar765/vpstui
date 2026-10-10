@@ -155,3 +155,80 @@ var errDial = &dialErr{}
 type dialErr struct{}
 
 func (d *dialErr) Error() string { return "dial tcp 127.0.0.1:1: connect: refused" }
+
+func TestDashboardGroupingAndFold(t *testing.T) {
+	mk := func(name, proj string) models.Container {
+		c := models.Container{ID: name, Names: name, Image: "img", State: "running", Status: "Up"}
+		if proj != "" {
+			c.Labels = "com.docker.compose.project=" + proj
+		}
+		return c
+	}
+	d := NewDashboard(host("h"), nil, 80, 24, 1)
+	d.containers = []models.Container{
+		mk("solo1", ""),
+		mk("web-a", "web"),
+		mk("db-a", "db"),
+		mk("web-b", "web"),
+	}
+	d.rebuild()
+
+	// rows: solo1, hdr(db), db-a, hdr(web), web-a, web-b
+	if len(d.rowCIdx) != 6 {
+		t.Fatalf("rows=%d, want 6 (%v)", len(d.rowCIdx), d.rowCIdx)
+	}
+	if d.rowCIdx[0] != 0 || d.rowCIdx[1] != -1 || d.rowCIdx[3] != -1 {
+		t.Fatalf("row map wrong: %v", d.rowCIdx)
+	}
+	// projects sorted: db before web
+	if d.rowProj[1] != "db" || d.rowProj[3] != "web" {
+		t.Fatalf("group order: %v", d.rowProj)
+	}
+
+	// cursor on header of web (row 3), fold it
+	d.tbl.SetCursor(3)
+	d.toggleFold()
+	if !d.collapsed["web"] {
+		t.Fatal("web should be collapsed")
+	}
+	if len(d.rowCIdx) != 4 {
+		t.Fatalf("rows after fold=%d, want 4", len(d.rowCIdx))
+	}
+	// selected() on a header row must fail
+	d.tbl.SetCursor(1)
+	if _, ok := d.selected(); ok {
+		t.Fatal("header row must not be selectable")
+	}
+	// unfold again: cursor back onto the folded web header (row 3)
+	d.tbl.SetCursor(3)
+	d.toggleFold()
+	if len(d.rowCIdx) != 6 {
+		t.Fatalf("rows after unfold=%d, want 6", len(d.rowCIdx))
+	}
+	// standalone row: fold is a no-op
+	d.tbl.SetCursor(0)
+	d.toggleFold()
+	if len(d.rowCIdx) != 6 {
+		t.Fatal("standalone fold should change nothing")
+	}
+}
+
+func TestSpaceKeyFoldsGroup(t *testing.T) {
+	d := NewDashboard(host("h"), nil, 80, 24, 1)
+	d.containers = []models.Container{
+		{ID: "x", Names: "x", Labels: "com.docker.compose.project=web", State: "running"},
+	}
+	d.rebuild()
+	d.tbl.SetCursor(0) // compose:web header
+	_, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !d.collapsed["web"] {
+		t.Fatalf("space did not fold: %v", d.collapsed)
+	}
+	if len(d.rowCIdx) != 1 {
+		t.Fatalf("rows after fold=%d, want 1 (header only)", len(d.rowCIdx))
+	}
+	_, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if d.collapsed["web"] || len(d.rowCIdx) != 2 {
+		t.Fatalf("space did not unfold: %v rows=%d", d.collapsed, len(d.rowCIdx))
+	}
+}
