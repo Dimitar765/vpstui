@@ -61,6 +61,22 @@ func helpLine(pairs ...string) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, b...)
 }
 
+// panel renders content inside a rounded frame with an optional title line.
+func panel(title, content string, width int) string {
+	block := content
+	if title != "" {
+		block = title + "\n" + strings.TrimRight(content, "\n")
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1).
+		// lipgloss Width excludes border and padding; shrink so the outer
+		// frame lands exactly at the requested width.
+		Width(max(width-4, 10)).
+		Render(block)
+}
+
 // pinFooter places body at the top of a height-row frame and footer on its
 // last row. If the body is taller than the frame the footer simply follows.
 func pinFooter(body, footer string, height int) string {

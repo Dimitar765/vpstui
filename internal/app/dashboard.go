@@ -637,30 +637,32 @@ func (d *Dashboard) View() string {
 	}
 	b.WriteString("\n")
 	if d.detail != nil {
-		b.WriteString(styleTitle.Render("detail — "+d.detail.name) + "\n")
+		var inner strings.Builder
 		if d.detail.loading {
-			b.WriteString(styleMuted.Render("inspecting…") + "\n")
+			inner.WriteString(styleMuted.Render("inspecting…") + "\n")
 		} else if d.detail.isErr {
-			b.WriteString(styleErr.Render(d.detail.text) + "\n")
+			inner.WriteString(styleErr.Render(d.detail.text) + "\n")
 		} else {
-			b.WriteString(d.detail.text)
+			inner.WriteString(d.detail.text)
 		}
+		b.WriteString(panel(styleTitle.Render("detail — "+d.detail.name), inner.String(), d.width) + "\n")
 		return pinFooter(b.String(), helpLine("esc", "close", "d", "close", "f", "refresh"), d.height)
 	}
 	if d.showDisk {
-		b.WriteString(styleTitle.Render("disk usage") + "\n")
+		var inner strings.Builder
 		if d.diskLoading {
-			b.WriteString(styleMuted.Render("querying\u2026") + "\n")
+			inner.WriteString(styleMuted.Render("querying\u2026") + "\n")
 		} else if d.diskErr != "" {
-			b.WriteString(styleErr.Render(d.diskErr) + "\n")
+			inner.WriteString(styleErr.Render(d.diskErr) + "\n")
 		} else if len(d.disk) == 0 {
-			b.WriteString(styleMuted.Render("no data") + "\n")
+			inner.WriteString(styleMuted.Render("no data") + "\n")
 		} else {
-			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s %8s %8s %12s %12s", "TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE")) + "\n")
+			inner.WriteString(styleMuted.Render(fmt.Sprintf("%-12s %8s %8s %12s %12s", "TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE")) + "\n")
 			for _, o := range d.disk {
-				b.WriteString(fmt.Sprintf("%-12s %8s %8s %12s %12s\n", o.Type, o.Total, o.Active, o.Size, o.Reclaimable))
+				inner.WriteString(fmt.Sprintf("%-12s %8s %8s %12s %12s\n", o.Type, o.Total, o.Active, o.Size, o.Reclaimable))
 			}
 		}
+		b.WriteString(panel(styleTitle.Render("disk usage"), inner.String(), d.width) + "\n")
 		return pinFooter(b.String(), helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close"), d.height)
 	}
 	if len(d.containers) == 0 && d.errMsg == "" && !d.disconnected {

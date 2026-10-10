@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"vpstui/internal/config"
 	"vpstui/internal/docker"
@@ -607,9 +608,17 @@ func (m *Model) View() string {
 	case viewForm, viewPrompt:
 		return pinFooter(m.form.View(m.width), m.form.Help(), m.height)
 	case viewConnecting:
-		body := m.tabBar() + "\n" + m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…" +
-			styleMuted.Render("  (esc: keep dialing in background)")
-		return pinFooter(body, "", m.height-m.tabRows())
+		inner := m.sp.View() + " connecting to " + styleKey.Render(m.pendingHost.Target()) + "…\n" +
+			styleMuted.Render("esc: keep dialing in background")
+		card := panel("", inner, min(m.width-6, 60))
+		out := m.tabBar()
+		if out != "" {
+			out += "\n"
+		}
+		return out + lipgloss.NewStyle().
+			Width(m.width).Height(max(m.height-m.tabRows(), 1)).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render(card)
 	case viewDashboard:
 		if s := m.activeSession(); s != nil && s.dash != nil {
 			return m.tabBar() + "\n" + s.dash.View()

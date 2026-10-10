@@ -29,7 +29,7 @@ type ContainerView struct {
 
 func NewContainerView(id, name string, w, h int) *ContainerView {
 	c := &ContainerView{id: id, name: name, running: true, width: w, height: h}
-	c.vp = viewport.New(max(w-2, 20), max(h-4, 5))
+	c.vp = viewport.New(max(w-6, 20), max(h-6, 5))
 	return c
 }
 
@@ -105,8 +105,8 @@ func (c *ContainerView) StreamDone(err error) {
 
 func (c *ContainerView) SetSize(w, h int) {
 	c.width, c.height = w, h
-	c.vp.Width = max(w-2, 20)
-	c.vp.Height = max(h-4, 5)
+	c.vp.Width = max(w-6, 20)
+	c.vp.Height = max(h-6, 5)
 }
 
 func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
@@ -116,15 +116,16 @@ func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
 }
 
 func (c *ContainerView) View() string {
-	var b strings.Builder
-	b.WriteString(styleTitle.Render("logs — "+c.name) + " " + styleMuted.Render("["+c.id[:min(len(c.id), 12)]+"]") + "\n")
-	if c.err != "" {
-		b.WriteString(styleErr.Render("stream ended: "+c.err) + "\n")
-	} else if !c.running {
-		b.WriteString(styleMuted.Render("stream ended") + "\n")
-	} else {
-		b.WriteString(styleOK.Render("● streaming…") + "\n")
+	title := styleTitle.Render("logs — "+c.name) + " " + styleMuted.Render("["+c.id[:min(len(c.id), 12)]+"]")
+	var status string
+	switch {
+	case c.err != "":
+		status = styleErr.Render("stream ended: " + c.err)
+	case !c.running:
+		status = styleMuted.Render("stream ended")
+	default:
+		status = styleOK.Render("● streaming…")
 	}
-	b.WriteString(c.vp.View() + "\n")
-	return pinFooter(b.String(), helpLine("↑/↓", "scroll", "pgup/pgdn", "page", "esc", "back"), c.height)
+	body := panel(title, status+"\n"+c.vp.View(), c.width-2)
+	return pinFooter(body, helpLine("↑/↓", "scroll", "pgup/pgdn", "page", "esc", "back"), c.height)
 }
