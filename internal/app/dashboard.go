@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"vpstui/internal/docker"
@@ -33,7 +32,7 @@ type Dashboard struct {
 	hostID string
 	gen    uint64
 
-	tbl          table.Model
+	tbl          ctable
 	containers   []models.Container
 	stats        map[string]models.ContainerStats // by container name
 	hstats       models.HostStats
@@ -64,21 +63,20 @@ type Dashboard struct {
 	shellBusy     bool
 }
 
-var tableColumns = []table.Column{
-	{Title: "Name", Width: 16},
-	{Title: "Image", Width: 18},
-	{Title: "State", Width: 9},
-	{Title: "Status", Width: 18},
-	{Title: "CPU %", Width: 7},
-	{Title: "MEM %", Width: 7},
-	{Title: "MEM USAGE", Width: 18},
+var dashCols = []ctableCol{
+	{title: "Name", width: 16, kind: cellPlain},
+	{title: "Image", width: 18, kind: cellPlain},
+	{title: "State", width: 12, kind: cellState},
+	{title: "Status", width: 18, kind: cellPlain},
+	{title: "CPU %", width: 7, kind: cellPct},
+	{title: "MEM %", width: 7, kind: cellPct},
+	{title: "MEM USAGE", width: 18, kind: cellPlain},
 }
 
 func NewDashboard(host models.Host, dock *docker.Executor, w, h int, gen uint64) *Dashboard {
 	d := &Dashboard{host: host, dock: dock, hostID: host.ID, gen: gen, stats: map[string]models.ContainerStats{}, collapsed: map[string]bool{}, width: w, height: h}
-	t := table.New(table.WithColumns(tableColumns), table.WithWidth(max(w-2, 20)))
-	t.Focus()
-	d.tbl = t
+	d.tbl.SetColumns(dashCols)
+	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
 	return d
 }
 
@@ -88,8 +86,7 @@ func (d *Dashboard) tag(hostID string, gen uint64) bool {
 
 func (d *Dashboard) SetSize(w, h int) {
 	d.width, d.height = w, h
-	d.tbl.SetWidth(max(w-2, 20))
-	d.tbl.SetHeight(max(h-10, 3))
+	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
 }
 
 func (d *Dashboard) TakeBack() bool {
@@ -454,16 +451,18 @@ func (d *Dashboard) rebuild() {
 		return order[i] < order[k]
 	})
 
-	rows := make([]table.Row, 0, len(d.containers))
+	rows := make([][]string, 0, len(d.containers))
+	hdrRows := make([]bool, 0, len(d.containers))
 	d.rowCIdx = d.rowCIdx[:0]
 	d.rowProj = d.rowProj[:0]
-	blank := func() table.Row { return table.Row{"", "", "", "", "", "", ""} }
+	blank := func() []string { return []string{"", "", "", "", "", "", ""} }
 
 	for _, p := range order {
 		idxs := byProj[p]
 		if p == "" {
 			for _, i := range idxs {
 				rows = append(rows, d.containerRow(d.containers[i]))
+				hdrRows = append(hdrRows, false)
 				d.rowCIdx = append(d.rowCIdx, i)
 				d.rowProj = append(d.rowProj, "")
 			}
@@ -477,6 +476,7 @@ func (d *Dashboard) rebuild() {
 		hdr := blank()
 		hdr[0] = fmt.Sprintf("%s compose:%s (%d)", marker, p, len(idxs))
 		rows = append(rows, hdr)
+		hdrRows = append(hdrRows, true)
 		d.rowCIdx = append(d.rowCIdx, -1)
 		d.rowProj = append(d.rowProj, p)
 		if folded {
@@ -484,12 +484,13 @@ func (d *Dashboard) rebuild() {
 		}
 		for _, i := range idxs {
 			rows = append(rows, d.containerRow(d.containers[i]))
+			hdrRows = append(hdrRows, false)
 			d.rowCIdx = append(d.rowCIdx, i)
 			d.rowProj = append(d.rowProj, p)
 		}
 	}
 
-	d.tbl.SetRows(rows)
+	d.tbl.SetRows(rows, hdrRows)
 	if cur >= len(rows) {
 		cur = len(rows) - 1
 	}
@@ -501,12 +502,12 @@ func (d *Dashboard) rebuild() {
 	}
 }
 
-func (d *Dashboard) containerRow(c models.Container) table.Row {
+func (d *Dashboard) containerRow(c models.Container) []string {
 	cpu, mem, memUsage := "-", "-", "-"
 	if s, ok := d.stats[c.ShortName()]; ok {
 		cpu, mem, memUsage = s.CPUPerc, s.MemPerc, s.MemUsage
 	}
-	return table.Row{c.ShortName(), c.Image, c.State, c.Status, cpu, mem, memUsage}
+	return []string{c.ShortName(), c.Image, c.State, c.Status, cpu, mem, memUsage}
 }
 
 func (d *Dashboard) toggleFold() {
