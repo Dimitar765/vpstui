@@ -166,6 +166,9 @@ func (m *Model) activeSession() *Session {
 func (m *Model) removeSession(s *Session) {
 	if idx := m.indexOf(s); idx >= 0 {
 		m.sessions = append(m.sessions[:idx], m.sessions[idx+1:]...)
+		if m.active > idx {
+			m.active--
+		}
 		if m.active >= len(m.sessions) {
 			m.active = len(m.sessions) - 1
 		}
@@ -288,6 +291,9 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if cancelled {
 			m.form = nil
 			m.view = viewHosts
+			if s := m.findSession(m.pendingHost.ID, m.pendingGen); s != nil && s.conn == nil {
+				m.removeSession(s)
+			}
 			return m, nil
 		}
 		return m, cmd
@@ -695,9 +701,10 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 		if foreground {
 			m.view = viewHosts
 			if strings.Contains(es, "passphrase-protected") || strings.Contains(es, "no password provided") {
-				s := &Session{host: msg.host, gen: m.nextGen()}
-				m.sessions = append(m.sessions, s)
-				m.active = m.indexOf(s)
+				ps := &Session{host: msg.host, gen: m.nextGen()}
+				m.sessions = append(m.sessions, ps)
+				m.active = m.indexOf(ps)
+				m.pendingHost, m.pendingGen = ps.host, ps.gen
 				label := "Password for "
 				if strings.Contains(es, "passphrase") {
 					label = "Key passphrase for "
