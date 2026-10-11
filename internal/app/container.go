@@ -102,6 +102,11 @@ type ContainerView struct {
 
 	pending int
 	follow  bool // stick to the bottom as lines arrive
+
+	// Log export state: exporting guards a second E while a write is in
+	// flight; note carries the one-row result shown in the header.
+	note      string
+	exporting bool
 	dropped bool // history has been trimmed, so rows[0] is the marker
 	dirty   bool // rows changed since the last SetContent
 	err     string
@@ -400,6 +405,10 @@ func (c *ContainerView) SetSize(w, h int) {
 	c.vp.Height = max(h-6, 5)
 }
 
+// SetNote shows a transient, clipped note in the header row (log export
+// results; the view has no toast of its own).
+func (c *ContainerView) SetNote(s string) { c.note = s }
+
 func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
 	km, isKey := msg.(tea.KeyMsg)
 	if isKey && c.searching {
@@ -438,6 +447,17 @@ func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
 		case "N":
 			c.jump(-1)
 			return c, nil
+		case "E":
+			if c.exporting {
+				return c, nil
+			}
+			if len(c.lines) == 0 {
+				c.note = "nothing to export"
+				return c, nil
+			}
+			c.exporting = true
+			c.note = "exporting…"
+			return c, exportLogs(c)
 		}
 	}
 	var cmd tea.Cmd
@@ -480,6 +500,9 @@ func (c *ContainerView) header() string {
 		status += "  " + styleMuted.Render("⌕ "+quotedTrunc(c.query, logQueryShowRunes)+
 			" "+strconv.Itoa(len(c.rows))+"/"+strconv.Itoa(len(c.lines)))
 	}
+	if c.note != "" {
+		status += "  " + styleMuted.Render(quotedTrunc(c.note, 48))
+	}
 	return status
 }
 
@@ -495,7 +518,7 @@ func (c *ContainerView) help() string {
 		return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "edit",
 			"m", want, "n/N", "jump", "esc", "clear")
 	}
-	return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "filter", "esc", "back")
+	return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "filter", "E", "export", "esc", "back")
 }
 
 // styleLine renders one raw log line: docker's timestamp dimmed to HH:MM:SS,

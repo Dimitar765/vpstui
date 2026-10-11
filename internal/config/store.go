@@ -21,6 +21,23 @@ func Dir() (string, error) {
 	return dir, nil
 }
 
+// DataDir returns (and creates, 0700) the vpstui XDG data directory plus its
+// logs subdirectory — the analogue of Dir() for state that is not config.
+func DataDir() (string, error) {
+	base := os.Getenv("XDG_DATA_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(home, ".local", "share")
+	}
+	if err := os.MkdirAll(filepath.Join(base, "vpstui", "logs"), 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "vpstui"), nil
+}
+
 func hostsPath() (string, error) {
 	dir, err := Dir()
 	if err != nil {

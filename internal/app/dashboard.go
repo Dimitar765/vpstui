@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,6 +87,15 @@ type Dashboard struct {
 	diskErr     string
 	disk        []models.DiskObject
 
+	// The image manager. imgConfirm points into images: the row pending a
+	// D-confirmed removal. Both die with the panel state on esc.
+	showImages bool
+	imgLoading bool
+	imgErr     string
+	images     []models.Image
+	imgTbl     ctable
+	imgConfirm *models.Image
+
 	errMsg       string
 	toast        string
 	toastIsErr   bool
@@ -118,6 +128,16 @@ type Dashboard struct {
 	// next tick. Safe against stale-tag drops because every (re)connect mints
 	// a fresh Dashboard — a stuck flag dies with its generation.
 	fetchBusy bool
+
+	// sortMode is the table row order; its zero value is the compose-project
+	// grouping. Cycled with < and >; resets with the generation on reconnect.
+	sortMode int
+
+	// evArmed makes the docker events stream once-per-generation, exactly like
+	// errArmed. evPending marks an event burst that arrived while a snapshot
+	// fetch was in flight; the next statsLoadedMsg flushes it as one refetch.
+	evArmed   bool
+	evPending bool
 }
 
 var dashCols = []ctableCol{
@@ -131,6 +151,27 @@ var dashCols = []ctableCol{
 }
 
 const cellGapTotal = 12 // 2-space gap × 6 between seven columns
+
+// Row orders for the container table. sortGrouped is the compose-project
+// grouping; the rest are flat sorts over every container.
+const (
+	sortGrouped = iota
+	sortName
+	sortState
+	sortCPU
+	sortMem
+	sortCount
+)
+
+var sortNames = [sortCount]string{"grouped", "name", "state", "cpu%", "mem%"}
+
+var imgCols = []ctableCol{
+	{title: "REPOSITORY", width: 24, kind: cellPlain},
+	{title: "TAG", width: 12, kind: cellPlain},
+	{title: "CREATED", width: 14, kind: cellPlain},
+	{title: "SIZE", width: 10, kind: cellPlain},
+	{title: "ID", width: 12, kind: cellPlain},
+}
 
 // staticColsW returns the width consumed by all non-adaptive columns
 // (State, CPU, MEM, gaps) plus Status and MEM USAGE at the given total.
@@ -330,6 +371,25 @@ func (d *Dashboard) SweepErrors() tea.Cmd {
 	}
 }
 
+// fetchImages lists the host's images for the manager panel. It runs only
+// while the panel is open: action-driven refreshes must not spend SSH round
+// trips on a screen the user is not reading.
+func (d *Dashboard) fetchImages() tea.Cmd {
+	if d.dock == nil || d.imgLoading || !d.showImages {
+		return nil
+	}
+	d.imgLoading = true
+	d.imgErr = ""
+	dock := d.dock
+	t := msgTag{hostID: d.hostID, gen: d.gen}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		imgs, err := dock.ImageList(ctx)
+		return imagesLoadedMsg{msgTag: t, images: imgs, err: err}
+	}
+}
+
 func (d *Dashboard) fetchDisk() tea.Cmd {
 	dock := d.dock
 	t := msgTag{hostID: d.hostID, gen: d.gen}
@@ -362,12 +422,19 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 
 	case statsLoadedMsg:
 		d.fetchBusy = false // first statement: cleared on success and error arms alike
+		// An event that landed while the snapshot was in flight coalesces into
+		// exactly one refetch, started after the flag above cleared the gate.
+		var flushCmd tea.Cmd
+		if d.evPending {
+			d.evPending = false
+			flushCmd = d.fetchNow()
+		}
 		if !msg.listOK {
 			d.errMsg = msg.err.Error()
 			if errors.Is(msg.err, sshclient.ErrConnLost) {
 				d.disconnected = true
 			}
-			return d, nil
+			return d, flushCmd
 		}
 		d.containers = msg.containers
 		d.stats = make(map[string]models.ContainerStats, len(msg.cstats))
@@ -387,7 +454,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		// the plan samples on, and it costs no extra SSH.
 		d.recordPerf(time.Now(), msg.cstats)
 		d.rebuildPerf()
-		return d, nil
+		return d, flushCmd
 
 	case actionDoneMsg:
 		label := msg.verb
@@ -402,10 +469,7 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			d.toastIsErr = false
 		}
 		d.errMsg = ""
-		if d.showDisk {
-			return d, tea.Batch(d.fetchNow(), d.fetchDisk())
-		}
-		return d, d.fetchNow()
+		return d, tea.Batch(d.fetchNow(), d.fetchImages(), d.fetchDisk())
 
 	case detailLoadedMsg:
 		if d.detail == nil {
@@ -442,6 +506,21 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			d.disk = msg.objs
 			d.diskErr = ""
 		}
+		return d, nil
+
+	case imagesLoadedMsg:
+		d.imgLoading = false
+		if msg.err != nil {
+			d.imgErr = msg.err.Error()
+			return d, nil
+		}
+		d.images = msg.images
+		d.imgErr = ""
+		rows := make([][]string, len(d.images))
+		for i, img := range d.images {
+			rows[i] = []string{img.Repository, img.Tag, img.CreatedSince, img.Size, img.ID}
+		}
+		d.imgTbl.SetRows(rows, nil)
 		return d, nil
 
 	case perfTickMsg:
@@ -519,6 +598,20 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 						return actionDoneMsg{msgTag: t, verb: verb, err: err}
 					}
 				}
+				if verb == "rm image" {
+					img := d.imgConfirm
+					d.imgConfirm = nil
+					if img == nil {
+						return d, nil
+					}
+					id := img.ID
+					name := img.Repository + ":" + img.Tag
+					return d, func() tea.Msg {
+						ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+						defer cancel()
+						return actionDoneMsg{msgTag: t, verb: verb, name: name, err: dock.ImageRm(ctx, id)}
+					}
+				}
 				c, ok := d.selected()
 				if !ok {
 					return d, nil
@@ -574,6 +667,25 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			}
 			return d, nil
 		}
+		if d.showImages {
+			switch msg.String() {
+			case "esc":
+				d.showImages = false
+				d.imgConfirm = nil
+			case "f":
+				d.imgErr = ""
+				return d, d.fetchImages()
+			case "D":
+				if cur := d.imgTbl.Cursor(); cur >= 0 && cur < len(d.images) {
+					d.imgConfirm = &d.images[cur]
+					d.confirm = "rm image"
+					return d, nil
+				}
+			}
+			var cmd tea.Cmd
+			d.imgTbl, cmd = d.imgTbl.Update(msg)
+			return d, cmd
+		}
 		if k := msg.String(); k == " " || k == "space" {
 			d.toggleFold()
 			return d, nil
@@ -619,10 +731,29 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			d.diskLoading = true
 			d.diskErr = ""
 			return d, d.fetchDisk()
+		case "I":
+			d.showPerf = false
+			d.showDisk = false
+			d.showImages = true
+			d.imgErr = ""
+			d.imgTbl.SetColumns(imgCols)
+			return d, d.fetchImages()
 		case "p":
 			// The ranking screen. Its all-time columns come from the same probe the
 			// first container list armed, so opening it usually shows numbers at once.
 			return d, d.openPerf()
+		case "<":
+			d.sortMode = (d.sortMode + sortCount - 1) % sortCount
+			d.rebuild()
+			d.toast = "sort: " + sortNames[d.sortMode]
+			d.toastIsErr = false
+			return d, nil
+		case ">":
+			d.sortMode = (d.sortMode + 1) % sortCount
+			d.rebuild()
+			d.toast = "sort: " + sortNames[d.sortMode]
+			d.toastIsErr = false
+			return d, nil
 		case "D":
 			if c, ok := d.selected(); ok {
 				if c.State == "exited" || c.State == "dead" || c.State == "created" {
@@ -671,6 +802,41 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 
 func (d *Dashboard) rebuild() {
 	cur := d.tbl.Cursor()
+
+	if d.sortMode != sortGrouped {
+		// Flat sort: every container in one list, no compose headers. The
+		// standalone branch's row assembly verbatim, then the same common tail.
+		idx := make([]int, len(d.containers))
+		for i := range idx {
+			idx[i] = i
+		}
+		less := d.sortLess(d.sortMode)
+		sort.SliceStable(idx, func(x, y int) bool { return less(idx[x], idx[y]) })
+		rows := make([][]string, 0, len(d.containers))
+		hdrRows := make([]bool, 0, len(d.containers))
+		tint := make([]string, 0, len(d.containers))
+		d.rowCIdx = d.rowCIdx[:0]
+		d.rowProj = d.rowProj[:0]
+		for _, i := range idx {
+			rows = append(rows, d.containerRow(d.containers[i]))
+			hdrRows = append(hdrRows, false)
+			tint = append(tint, d.tagColorOf(d.containers[i]))
+			d.rowCIdx = append(d.rowCIdx, i)
+			d.rowProj = append(d.rowProj, "")
+		}
+		d.tbl.SetRows(rows, hdrRows)
+		d.tbl.SetTint(tint)
+		if cur >= len(rows) {
+			cur = len(rows) - 1
+		}
+		if cur < 0 {
+			cur = 0
+		}
+		if len(rows) > 0 {
+			d.tbl.SetCursor(cur)
+		}
+		return
+	}
 
 	byProj := map[string][]int{}
 	var order []string
@@ -741,6 +907,55 @@ func (d *Dashboard) rebuild() {
 	}
 	if len(rows) > 0 {
 		d.tbl.SetCursor(cur)
+	}
+}
+
+// sortLess returns the container-index comparator for a flat sort mode. Every
+// comparator breaks ties by lowercased short name so equal keys keep one
+// predictable order. A container with no stats row parses as −1 and therefore
+// sorts last in the descending percentage sorts.
+func (d *Dashboard) sortLess(mode int) func(a, b int) bool {
+	stateRank := map[string]int{"running": 0, "paused": 1, "restarting": 2, "created": 3, "exited": 5, "dead": 6}
+	name := func(i int) string { return strings.ToLower(d.containers[i].ShortName()) }
+	pct := func(field func(models.ContainerStats) string) func(int) float64 {
+		return func(i int) float64 {
+			s, ok := d.stats[d.containers[i].ShortName()]
+			if !ok {
+				return -1
+			}
+			if v, ok := perf.Percent(field(s)); ok {
+				return v
+			}
+			return -1
+		}
+	}
+	cpuPct := pct(func(s models.ContainerStats) string { return s.CPUPerc })
+	memPct := pct(func(s models.ContainerStats) string { return s.MemPerc })
+	switch mode {
+	case sortState:
+		return func(a, b int) bool {
+			ra, rb := stateRank[d.containers[a].State], stateRank[d.containers[b].State]
+			if ra != rb {
+				return ra < rb
+			}
+			return name(a) < name(b)
+		}
+	case sortCPU:
+		return func(a, b int) bool {
+			if pa, pb := cpuPct(a), cpuPct(b); pa != pb {
+				return pa > pb
+			}
+			return name(a) < name(b)
+		}
+	case sortMem:
+		return func(a, b int) bool {
+			if pa, pb := memPct(a), memPct(b); pa != pb {
+				return pa > pb
+			}
+			return name(a) < name(b)
+		}
+	default: // sortName
+		return func(a, b int) bool { return name(a) < name(b) }
 	}
 }
 
@@ -820,7 +1035,12 @@ func (d *Dashboard) View() string {
 	}
 	if d.confirm != "" {
 		label := d.confirm
-		if !strings.HasPrefix(label, "prune") {
+		switch {
+		case strings.HasPrefix(label, "prune"):
+			// No object name: the whole host is the target.
+		case label == "rm image" && d.imgConfirm != nil:
+			label = fmt.Sprintf("%s %s:%s", label, d.imgConfirm.Repository, d.imgConfirm.Tag)
+		default:
 			if c, ok := d.selected(); ok {
 				label = fmt.Sprintf("%s %s", d.confirm, c.ShortName())
 			}
@@ -873,6 +1093,25 @@ func (d *Dashboard) View() string {
 		b.WriteString(d.perfTbl.View() + "\n")
 		return pinFooter(b.String(), footer, d.width, d.height)
 	}
+	if d.showImages {
+		footer := helpLine("D", "remove image", "f", "refresh", "esc", "close")
+		if d.imgLoading {
+			b.WriteString(styleMuted.Render("querying…") + "\n")
+		} else if d.imgErr != "" {
+			b.WriteString(styleErr.Render(d.imgErr) + "\n")
+		} else if len(d.images) == 0 {
+			b.WriteString(styleMuted.Render("no images") + "\n")
+		} else {
+			head := b.String() + strconv.Itoa(len(d.images)) + " images\n"
+			// The frame is exact: the table gets whatever the header and the
+			// footer leave, so pinFooter never has to overflow the terminal.
+			d.imgTbl.SetSize(max(d.width-2, 20),
+				max(d.height-lipgloss.Height(head)-lipgloss.Height(footer)-1, 1))
+			b.WriteString(strconv.Itoa(len(d.images)) + " images\n")
+			b.WriteString(d.imgTbl.View() + "\n")
+		}
+		return pinFooter(b.String(), footer, d.width, d.height)
+	}
 	if d.showDisk {
 		var inner strings.Builder
 		if d.diskLoading {
@@ -898,7 +1137,7 @@ func (d *Dashboard) View() string {
 	if d.disconnected {
 		footer = helpLine("c", "reconnect", "esc", "back")
 	} else {
-		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "p", "perf", "t", "tag", "T", "untag", "a", "errors", "f", "refresh", "esc", "back")
+		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "p", "perf", "<", "sort", ">", "sort", "t", "tag", "T", "untag", "a", "errors", "f", "refresh", "esc", "back")
 	}
 	return pinFooter(b.String(), footer, d.width, d.height)
 }

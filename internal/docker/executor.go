@@ -389,6 +389,97 @@ func parseDF(out string) []models.DiskObject {
 	return res
 }
 
+// imagesCmd lists the host's images as NDJSON, one object per row.
+const imagesCmd = `docker images --format '{{json .}}'`
+
+type imageJSON struct {
+	ID           string `json:"ID"`
+	Repository   string `json:"Repository"`
+	Tag          string `json:"Tag"`
+	CreatedSince string `json:"CreatedSince"`
+	Size         string `json:"Size"`
+}
+
+// ImageList lists the host's images in one round trip.
+func (e *Executor) ImageList(ctx context.Context) ([]models.Image, error) {
+	out, err := e.exec(ctx, 20*time.Second, imagesCmd)
+	if err != nil {
+		return nil, err
+	}
+	return parseImages(out), nil
+}
+
+// parseImages parses the NDJSON produced by `docker images --format '{{json .}}'`.
+// A full "sha256:<hex>" ID is reduced to the bare hex so the removal path
+// only ever sees validated hex.
+func parseImages(out string) []models.Image {
+	var res []models.Image
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var j imageJSON
+		if err := json.Unmarshal([]byte(line), &j); err != nil {
+			continue
+		}
+		id := strings.TrimPrefix(j.ID, "sha256:")
+		res = append(res, models.Image{
+			ID:           id,
+			Repository:   j.Repository,
+			Tag:          j.Tag,
+			CreatedSince: j.CreatedSince,
+			Size:         j.Size,
+		})
+	}
+	return res
+}
+
+// ImageRm removes one image by its (short) hex id. Anything that is not
+// bare hex is rejected here, before a connection is touched — the same rule
+// validPeakIDs applies to the peaks probe.
+func (e *Executor) ImageRm(ctx context.Context, id string) error {
+	if !peakIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid image id")
+	}
+	_, err := e.exec(ctx, 30*time.Second, "docker image rm "+quote(id))
+	return err
+}
+
+// Event is one container lifecycle event, reduced to what a refresh
+// trigger needs.
+type Event struct {
+	Action string
+	ID     string
+	Name   string // docker name from Actor.Attributes; "" when absent
+	At     time.Time
+}
+
+// ParseEvent decodes one `docker events --format '{{json .}}'` line.
+// ok is false for blank/malformed lines and non-container events.
+func ParseEvent(line string) (Event, bool) {
+	var j struct {
+		Type   string `json:"Type"`
+		Action string `json:"Action"`
+		Actor  struct {
+			ID         string            `json:"ID"`
+			Attributes map[string]string `json:"Attributes"`
+		} `json:"Actor"`
+		Time int64 `json:"time"`
+	}
+	if err := json.Unmarshal([]byte(line), &j); err != nil || j.Type != "container" || j.Action == "" || j.Actor.ID == "" {
+		return Event{}, false
+	}
+	return Event{Action: j.Action, ID: j.Actor.ID, Name: j.Actor.Attributes["name"],
+		At: time.Unix(j.Time, 0)}, true
+}
+
+// StreamEvents streams container lifecycle events, one NDJSON line each.
+// The reader ends when the connection drops or the caller closes it.
+func (e *Executor) StreamEvents(ctx context.Context) (io.ReadCloser, error) {
+	return e.conn.StreamExec(ctx, `docker events --filter type=container --format '{{json .}}'`)
+}
+
 func (e *Executor) PruneImages(ctx context.Context) error {
 	_, err := e.exec(ctx, 120*time.Second, `docker image prune -f`)
 	return err

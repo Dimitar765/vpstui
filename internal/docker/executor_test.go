@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"vpstui/internal/models"
 	"vpstui/internal/sshclient"
@@ -570,6 +571,68 @@ func TestSnapshotParsesThreeSections(t *testing.T) {
 	} {
 		if _, _, _, err := parseSnapshot(bad); err == nil || !strings.Contains(err.Error(), "expected 3 sections") {
 			t.Errorf("%s: err = %v, want section-count error", name, err)
+		}
+	}
+}
+
+func TestImageCommands(t *testing.T) {
+	const want = `docker images --format '{{json .}}'`
+	if imagesCmd != want {
+		t.Errorf("imagesCmd = %q, want %q", imagesCmd, want)
+	}
+
+	// ImageRm must validate before dialing: with a nil conn any reach into
+	// the connection panics, so surviving these calls proves the ordering.
+	dock := New(nil)
+	ctx := context.Background()
+	for _, id := range []string{"x'; rm -rf /", "TOO-SHORT", "8f30766c1db2 extra", "UPPERCASE99"} {
+		err := dock.ImageRm(ctx, id)
+		if err == nil || err.Error() != "invalid image id" {
+			t.Errorf("ImageRm(%q) err = %v, want invalid image id", id, err)
+		}
+	}
+}
+
+func TestParseImages(t *testing.T) {
+	const sample = `{"ID":"8f30766c1db2","Repository":"nginx","Tag":"latest","CreatedSince":"2 weeks ago","Size":"187MB"}` + "\n" +
+		`{"ID":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","Repository":"alpine","Tag":"3.19","CreatedSince":"5 days ago","Size":"7MB"}` + "\n" +
+		`not json` + "\n" +
+		"\n"
+	got := parseImages(sample)
+	if len(got) != 2 {
+		t.Fatalf("rows=%d, want 2", len(got))
+	}
+	if got[0] != (models.Image{ID: "8f30766c1db2", Repository: "nginx", Tag: "latest", CreatedSince: "2 weeks ago", Size: "187MB"}) {
+		t.Errorf("row 0 = %+v", got[0])
+	}
+	if got[1].ID != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Errorf("row 1 ID = %q, want sha256: prefix stripped", got[1].ID)
+	}
+	if res := parseImages(""); res != nil {
+		t.Errorf("parseImages(\"\") = %+v, want nil", res)
+	}
+}
+
+func TestParseEvent(t *testing.T) {
+	const line = `{"status":"start","id":"8f3","from":"nginx","Type":"container","Action":"start","Actor":{"ID":"8f30766c1db2","Attributes":{"image":"nginx","name":"web-1"}},"scope":"local","time":1757800000}`
+	ev, ok := ParseEvent(line)
+	if !ok {
+		t.Fatalf("ParseEvent rejected a valid container event")
+	}
+	want := Event{Action: "start", ID: "8f30766c1db2", Name: "web-1", At: time.Unix(1757800000, 0)}
+	if ev != want {
+		t.Errorf("event = %+v, want %+v", ev, want)
+	}
+
+	for name, bad := range map[string]string{
+		"non-container": `{"Type":"network","Action":"connect","Actor":{"ID":"abc123","Attributes":{}},"time":1757800000}`,
+		"malformed":     `{"Type":"container",`,
+		"no action":     `{"Type":"container","Actor":{"ID":"8f30766c1db2","Attributes":{}},"time":1757800000}`,
+		"no actor id":   `{"Type":"container","Action":"die","Actor":{"ID":"","Attributes":{"name":"web"}},"time":1757800000}`,
+		"blank":         "",
+	} {
+		if ev, ok := ParseEvent(bad); ok {
+			t.Errorf("%s: ParseEvent accepted %q -> %+v", name, bad, ev)
 		}
 	}
 }

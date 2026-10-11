@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -140,6 +142,25 @@ type errLoadedMsg struct {
 type diskLoadedMsg struct {
 	msgTag
 	objs []models.DiskObject
+	err  error
+}
+
+type imagesLoadedMsg struct {
+	msgTag
+	images []models.Image
+	err    error
+}
+
+// eventsMsg carries one docker container lifecycle event from the per-host
+// events stream to the UI goroutine. It is a refresh accelerator only.
+type eventsMsg struct {
+	msgTag
+	ev docker.Event
+}
+
+type exportDoneMsg struct {
+	msgTag
+	path string
 	err  error
 }
 
@@ -354,7 +375,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case persistDoneMsg:
 		return m.onPersistDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logOpenedMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, errLoadedMsg, shellExitedMsg, shellProbeDoneMsg, peaksLoadedMsg, perfTickMsg, perfLoadedMsg, retryMsg:
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logOpenedMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, imagesLoadedMsg, eventsMsg, exportDoneMsg, errLoadedMsg, shellExitedMsg, shellProbeDoneMsg, peaksLoadedMsg, perfTickMsg, perfLoadedMsg, retryMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -889,6 +910,12 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case diskLoadedMsg:
 		t = msg.msgTag
+	case imagesLoadedMsg:
+		t = msg.msgTag
+	case eventsMsg:
+		t = msg.msgTag
+	case exportDoneMsg:
+		t = msg.msgTag
 	case peaksLoadedMsg:
 		t = msg.msgTag
 	case perfTickMsg:
@@ -920,12 +947,20 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil // chain stops while not viewing
 	case statsLoadedMsg:
 		if s.dash != nil {
-			s.dash, _ = s.dash.Update(msg)
+			var dcmd tea.Cmd
+			s.dash, dcmd = s.dash.Update(msg)
 			m.publish(s)
 			// One sweep and one cgroup probe per generation, both started by the
 			// first container list that succeeded — never by the 2 s tick beside it.
 			var cmds []tea.Cmd
+			if dcmd != nil {
+				cmds = append(cmds, dcmd)
+			}
 			if msg.listOK {
+				if !s.dash.evArmed {
+					s.dash.evArmed = true
+					cmds = append(cmds, startEvents(s, m.send))
+				}
 				if !s.dash.errArmed {
 					s.dash.errArmed = true
 					if c := s.dash.SweepErrors(); c != nil {
@@ -1026,6 +1061,32 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detailLoadedMsg, diskLoadedMsg:
 		if s.dash != nil {
 			s.dash, _ = s.dash.Update(msg)
+		}
+		return m, nil
+	case imagesLoadedMsg:
+		if s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
+			m.publish(s)
+		}
+		return m, nil
+	case eventsMsg:
+		// Only the dashboard on screen reacts: background hosts must not gain
+		// SSH traffic their paused tick deliberately avoids.
+		if s.dash == nil || m.activeSession() != s || s.dash.fetchBusy {
+			if s.dash != nil && m.activeSession() == s {
+				s.dash.evPending = true
+			}
+			return m, nil
+		}
+		return m, s.dash.fetchNow()
+	case exportDoneMsg:
+		if s.cv != nil {
+			s.cv.exporting = false
+			if msg.err != nil {
+				s.cv.SetNote("export failed: " + msg.err.Error())
+			} else {
+				s.cv.SetNote("saved: " + msg.path)
+			}
 		}
 		return m, nil
 	case shellExitedMsg:
@@ -1378,6 +1439,71 @@ func (m *Model) onPersistDone(msg persistDoneMsg) (tea.Model, tea.Cmd) {
 	}
 	m.status = msg.what + " failed: " + msg.err.Error()
 	return m, nil
+}
+
+// startEvents opens one docker events stream per generation. Each parsed
+// container event nudges the active session's dashboard to refetch; the
+// 2s tick remains the floor. The stream dies with the connection, and a
+// fresh Dashboard (every reconnect mints one) re-arms it via evArmed.
+func startEvents(s *Session, send func(tea.Msg)) tea.Cmd {
+	dock := s.dock
+	t := msgTag{hostID: s.host.ID, gen: s.gen}
+	return func() tea.Msg {
+		r, err := dock.StreamEvents(context.Background())
+		if err != nil {
+			return nil // events are an accelerator; the tick still refreshes
+		}
+		go func() {
+			defer r.Close()
+			sc := bufio.NewScanner(r)
+			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			for sc.Scan() {
+				if ev, ok := docker.ParseEvent(sc.Text()); ok && send != nil {
+					send(eventsMsg{msgTag: t, ev: ev})
+				}
+			}
+		}()
+		return nil
+	}
+}
+
+// exportLogs writes the whole buffered history to
+// <DataDir>/logs/<host>-<container>-<timestamp>.log off the UI goroutine,
+// via the atomic-write helper.
+func exportLogs(c *ContainerView) tea.Cmd {
+	t := msgTag{hostID: c.hostID, gen: c.gen}
+	host, name := sanitizeFileToken(c.hostID), sanitizeFileToken(c.name)
+	lines := append([]string(nil), c.lines...) // copy: Append may extend the original while we write
+	return func() tea.Msg {
+		dir, err := config.DataDir()
+		if err != nil {
+			return exportDoneMsg{msgTag: t, err: err}
+		}
+		path := filepath.Join(dir, "logs",
+			host+"-"+name+"-"+time.Now().Format("20060102-150405")+".log")
+		if err := config.WriteFileAtomic(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+			return exportDoneMsg{msgTag: t, err: err}
+		}
+		return exportDoneMsg{msgTag: t, path: path}
+	}
+}
+
+// sanitizeFileToken keeps filename-safe runes and replaces everything else
+// (docker names may contain any printable character).
+func sanitizeFileToken(s string) string {
+	if s == "" {
+		return "container"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	return b.String()
 }
 
 func startLogStream(s *Session, id string, send func(tea.Msg)) tea.Cmd {

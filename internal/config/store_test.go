@@ -204,3 +204,44 @@ func TestDirPermissions(t *testing.T) {
 		t.Errorf("config dir mode = %o, want 0700", perm)
 	}
 }
+
+func TestDataDir(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", base)
+
+	dir, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir: %v", err)
+	}
+	if want := filepath.Join(base, "vpstui"); dir != want {
+		t.Fatalf("DataDir() = %q, want %q", dir, want)
+	}
+	logs := filepath.Join(dir, "logs")
+	fi, err := os.Stat(logs)
+	if err != nil {
+		t.Fatalf("stat logs dir: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("logs path %q is not a directory", logs)
+	}
+	if perm := fi.Mode().Perm(); perm != 0700 {
+		t.Errorf("logs dir mode = %o, want 0700", perm)
+	}
+}
+
+func TestDataDirHomeFallback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", home)
+
+	dir, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir: %v", err)
+	}
+	if want := filepath.Join(home, ".local", "share", "vpstui"); dir != want {
+		t.Fatalf("DataDir() = %q, want %q", dir, want)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "logs")); err != nil {
+		t.Fatalf("logs dir not created: %v", err)
+	}
+}

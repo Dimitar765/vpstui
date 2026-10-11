@@ -148,3 +148,12 @@ type DiskObject struct {
 	Size        string
 	Reclaimable string
 }
+
+// Image is one row of `docker images`.
+type Image struct {
+	ID           string
+	Repository   string
+	Tag          string
+	CreatedSince string
+	Size         string
+}

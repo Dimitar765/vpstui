@@ -120,7 +120,10 @@ func Dial(ctx context.Context, h models.Host, secret string) (*Conn, error) {
 	}
 
 	c := &Conn{client: client, keepStop: make(chan struct{})}
-	go c.keepalive()
+	// Snapshot the pacing vars here — on the caller's goroutine — so the
+	// keepalive goroutine never reads package vars that tests shrink while
+	// earlier connections are still winding down.
+	go c.keepalive(keepaliveEvery, probeTimeout, probeBudget)
 	return c, nil
 }
 
@@ -201,12 +204,20 @@ func authMethods(h models.Host, secret string) ([]ssh.AuthMethod, error) {
 	}
 }
 
-// keepalive probes the transport every 30s. Each probe gets 10s to answer;
-// two consecutive failures — timeout or error — close the connection, so a
-// dead link is detected without a budget of one flaky probe, and the typed
-// ErrConnLost signal reaches the session's next exec.
-func (c *Conn) keepalive() {
-	t := time.NewTicker(30 * time.Second)
+// Keepalive pacing; vars so tests can shrink them.
+var (
+	keepaliveEvery = 30 * time.Second
+	probeTimeout   = 10 * time.Second
+	probeBudget    = 2
+)
+
+// keepalive probes the transport every keepaliveEvery. Each probe gets
+// probeTimeout to answer; probeBudget consecutive failures — timeout or
+// error — close the connection, so a dead link is detected without a budget
+// of one flaky probe, and the typed ErrConnLost signal reaches the session's
+// next exec.
+func (c *Conn) keepalive(every, timeout time.Duration, budget int) {
+	t := time.NewTicker(every)
 	defer t.Stop()
 	failures := 0
 	for {
@@ -220,12 +231,12 @@ func (c *Conn) keepalive() {
 			var err error
 			select {
 			case err = <-res:
-			case <-time.After(10 * time.Second):
+			case <-time.After(timeout):
 				err = errors.New("keepalive probe timed out")
 			}
 			if err != nil {
 				failures++
-				if failures >= 2 {
+				if failures >= budget {
 					c.Close()
 					return
 				}
@@ -277,7 +288,7 @@ func isConnErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	for _, frag := range []string{"connection lost", "eof", "use of closed", "broken pipe"} {
+	for _, frag := range []string{"connection lost", "eof", "use of closed", "broken pipe", "without exit status"} {
 		if strings.Contains(s, frag) {
 			return true
 		}

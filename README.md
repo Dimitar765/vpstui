@@ -16,9 +16,13 @@ VPS servers over SSH, written in Go.
   container table (state, status, CPU %, MEM %) refreshed every 2s, all
   computed by one batched `docker ps` / `docker stats --no-stream` exec over
   SSH. Columns adapt to the terminal width; running/exited/other states are
-  color-coded and high CPU/MEM readings highlight as they climb. If the SSH
-  connection drops, vpstui retries once automatically after ~5s; if that also
-  fails it shows the "connection lost — press c to reconnect" banner and `c`
+  color-coded and high CPU/MEM readings highlight as they climb. A
+  `docker events` stream makes container start/stop appear instantly instead
+  of waiting for the next tick, and `<`/`>` cycle the row order
+  (grouped/name/state/cpu%/mem%). `I` opens an image manager
+  (`docker images`) where `D` removes an image after `y/N` confirmation. If
+  the SSH connection drops, vpstui retries once automatically after ~5s; if
+  that also fails it shows the "connection lost — press c to reconnect" banner and `c`
   redials by hand.
 - **Container actions** — start (`s`), stop (`x`), restart (`r`), remove (`D`,
   stopped containers only) with `y/N` confirmation. Containers are grouped by
@@ -392,7 +396,9 @@ a busy port just prints a warning to stderr and leaves the TUI working.
 `VPSTUI_LOG_TAIL` sets how many lines `docker logs --tail` replays when a log
 screen opens — default 2000, clamped to 1..100000, ignored if unparseable. The
 view then keeps up to 8 MiB (or 100k lines) of history, dropping whole older
-lines behind a `… (older lines dropped) …` marker.
+lines behind a `… (older lines dropped) …` marker. `E` writes whatever is
+buffered to `~/.local/share/vpstui/logs/<host>-<container>-<timestamp>.log`
+(the XDG data dir, `XDG_DATA_HOME` respected).
 
 The error sweep has its own two bounds, applied per container by `docker logs`:
 `VPSTUI_ERR_SINCE` (default `2h`; a Go duration, with `d`/`w` understood, clamped
