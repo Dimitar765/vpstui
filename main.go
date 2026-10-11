@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,6 +24,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "_shell" {
 		os.Exit(shell.Main(os.Args[2:]))
 	}
+	// SIGINT/SIGTERM cancel the program context: Bubble Tea unwinds the UI and
+	// Run returns, so the API server gets a clean shutdown instead of a kill.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	hosts, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning:", err)
@@ -31,10 +38,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "warning:", err)
 	}
 	m := app.New(hosts, tags)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	m.Attach(p.Send)
 
-	srv, _ := startAPI(m.HTTPStore())
+	srv, ln := startAPI(m.HTTPStore())
+	defer func() {
+		if ln != nil {
+			_ = ln.Close()
+		}
+	}()
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -42,9 +54,11 @@ func main() {
 	}
 
 	if srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		// Background, not the signal context: on ctrl-c that one is already
+		// canceled and would abort the drain before it started.
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = srv.Shutdown(sctx)
 	}
 }
 

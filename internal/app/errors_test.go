@@ -162,6 +162,37 @@ func TestParseErrSweepTrimsToLineBoundary(t *testing.T) {
 	}
 }
 
+// The 500-line corpus cap must run before signature(): kept-but-doomed lines
+// would each pay the six normalization regexes for nothing.
+func TestParseErrSweepCapsCorpusBeforeSigning(t *testing.T) {
+	at := time.Now()
+	var rows []string
+	total := errCorpusCap + 120
+	for i := range total {
+		rows = append(rows, sweepLine(fmt.Sprintf("c%d", i), "web", fmt.Sprintf("ERROR line %d", i)))
+	}
+	got, truncated := parseErrSweep(strings.Join(rows, "\n")+"\n", "h", "alpha", at)
+	if !truncated {
+		t.Error("over-cap corpus did not report truncation")
+	}
+	if len(got) != errCorpusCap {
+		t.Fatalf("kept %d lines, want the %d cap", len(got), errCorpusCap)
+	}
+	// The newest survived, in order, and every survivor is signed.
+	wantFirst, wantLast := total-errCorpusCap, total-1
+	if got[0].ID != fmt.Sprintf("c%d", wantFirst) || got[len(got)-1].ID != fmt.Sprintf("c%d", wantLast) {
+		t.Fatalf("window = [%s..%s], want [c%d..c%d]", got[0].ID, got[len(got)-1].ID, wantFirst, wantLast)
+	}
+	for i, l := range got {
+		if l.Sig == "" {
+			t.Fatalf("line %d (%s) left unsigned", i, l.ID)
+		}
+		if l.Sig != signature(l.Text) {
+			t.Fatalf("line %d sig %q stale", i, l.Sig)
+		}
+	}
+}
+
 func TestKeepErrLine(t *testing.T) {
 	tests := []struct {
 		name    string

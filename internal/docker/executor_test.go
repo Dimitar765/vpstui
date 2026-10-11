@@ -3,11 +3,14 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
 
 	"vpstui/internal/models"
+	"vpstui/internal/sshclient"
 )
 
 func TestQuote(t *testing.T) {
@@ -149,6 +152,14 @@ func TestFriendly(t *testing.T) {
 			stderr:  "permission denied on /mnt/data",
 			err:     baseErr,
 			wantMsg: "permission denied on /mnt/data",
+		},
+		{
+			// The auto-retry keys on this: friendly must not re-wrap the
+			// typed signal into an unrecognizable message.
+			name:   "connection loss passes through typed",
+			stderr: "",
+			err:    fmt.Errorf("%w: %v", sshclient.ErrConnLost, io.EOF),
+			wantIs: sshclient.ErrConnLost,
 		},
 	}
 	for _, tt := range tests {
@@ -501,6 +512,64 @@ func TestParseContainerPeaks(t *testing.T) {
 		"8f30766c1db2\t1\t2\t3\n", "shell noise: cat: not found\n"} {
 		if rows := parseContainerPeaks(bad); len(rows) != 0 {
 			t.Errorf("parseContainerPeaks(%q) returned %d rows", bad, len(rows))
+		}
+	}
+}
+
+// The snapshot is one shell string, so its exact shape is the contract: the
+// two \x1e separators delimit the three sections and `docker ps`'s exit code
+// is the shell's, while `docker stats` may fail without sinking the batch.
+func TestSnapshotCommand(t *testing.T) {
+	const want = `sh -c 'docker ps -a --format "{{json .}}"; rc=$?; printf "\036"; ` +
+		`docker stats --no-stream --format "{{json .}}" || true; printf "\036"; ` +
+		`cat /proc/loadavg; cat /proc/uptime; grep -E "^Mem(Total|Available):" /proc/meminfo; nproc; exit $rc'`
+	if snapshotCmd != want {
+		t.Errorf("snapshotCmd = %q,\n want         %q", snapshotCmd, want)
+	}
+	for _, frag := range []string{`--format "{{json .}}"`, "--no-stream", "|| true", "exit $rc",
+		"/proc/loadavg", "/proc/uptime", "Mem(Total|Available)", "nproc"} {
+		if !strings.Contains(snapshotCmd, frag) {
+			t.Errorf("command is missing %q", frag)
+		}
+	}
+}
+
+// parseSnapshot is Snapshot's whole parsing half against a canned payload.
+
+func TestSnapshotParsesThreeSections(t *testing.T) {
+	ps := `{"Id":"8f30766c1db2","Names":"web","Image":"nginx","State":"running","Status":"Up 2 hours","CreatedAt":"2026-10-10 20:03:28 +0000 UTC","Labels":"","Networks":"bridge"}` + "\n"
+	stats := `{"Id":"8f30766c1db2","Name":"web","CPUPerc":"0.15%","MemUsage":"12MiB / 1.9GiB","MemPerc":"0.61%"}` + "\n"
+	host := "0.10 0.08 0.05 1/234 5678\n12345.67 23456.78\nMemTotal:  2019460 kB\nMemAvailable:  1512000 kB\n4\n"
+	payload := ps + "\x1e" + stats + "\x1e" + host
+
+	containers, cstats, hs, err := parseSnapshot(payload)
+	if err != nil {
+		t.Fatalf("parseSnapshot: %v", err)
+	}
+	if len(containers) != 1 || containers[0].ID != "8f30766c1db2" || containers[0].Names != "web" {
+		t.Errorf("containers = %+v", containers)
+	}
+	if len(cstats) != 1 || cstats[0].ID != "8f30766c1db2" || cstats[0].CPUPerc != "0.15%" {
+		t.Errorf("cstats = %+v", cstats)
+	}
+	if hs.NumCPU != 4 || hs.Load1 != 0.10 || hs.UptimeSec != 12345.67 || hs.MemTotalMB != 1972 || hs.MemUsedMB != 1972-1476 {
+		t.Errorf("host stats = %+v", hs)
+	}
+
+	// An empty stats section (docker stats failed under `|| true`) yields no
+	// rows, not an error.
+	if _, cstats, _, err := parseSnapshot(ps + "\x1e\x1e" + host); err != nil || len(cstats) != 0 {
+		t.Errorf("empty stats section: cstats=%d err=%v", len(cstats), err)
+	}
+
+	// Fewer or more sections is a protocol breach, not silently swapped data.
+	for name, bad := range map[string]string{
+		"two sections":  ps + "\x1e" + host,
+		"four sections": ps + "\x1e" + stats + "\x1e" + host + "\x1eextra",
+		"no separator":  ps + stats + host,
+	} {
+		if _, _, _, err := parseSnapshot(bad); err == nil || !strings.Contains(err.Error(), "expected 3 sections") {
+			t.Errorf("%s: err = %v, want section-count error", name, err)
 		}
 	}
 }

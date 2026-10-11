@@ -11,7 +11,10 @@ import (
 	"vpstui/internal/config"
 )
 
-const service = "vpstui"
+const (
+	service      = "vpstui"
+	probeService = "vpstui-probe" // probe key only; can never collide with user secrets
+)
 
 var (
 	mu        sync.Mutex
@@ -22,9 +25,9 @@ func useKeyring() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	if keyringOK == nil {
-		ok := keyring.Set(service, "__probe__", "1") == nil
+		ok := keyring.Set(probeService, "__probe__", "1") == nil
 		if ok {
-			_ = keyring.Delete(service, "__probe__")
+			_ = keyring.Delete(probeService, "__probe__")
 		}
 		keyringOK = &ok
 	}
@@ -67,21 +70,7 @@ func writeFile(m map[string]string) error {
 	if err != nil {
 		return err
 	}
-	tmp := p + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, p)
+	return config.WriteFileAtomic(p, data, 0600)
 }
 
 func Set(name, value string) error {
@@ -104,10 +93,13 @@ func Get(name string) (string, error) {
 		if err == nil {
 			return v, nil
 		}
-		if errors.Is(err, keyring.ErrNotFound) {
-			return "", nil
+		if !errors.Is(err, keyring.ErrNotFound) {
+			// A real keyring failure must not silently read a possibly stale
+			// file copy; callers treat any error as "prompt again".
+			return "", err
 		}
-		// other keyring errors fall through to the file store
+		// Not in the keyring: fall through — the secret may live in the file
+		// store because its Set fell back after a keyring write failure.
 	}
 	m, err := readFile()
 	if err != nil {
@@ -117,15 +109,21 @@ func Get(name string) (string, error) {
 }
 
 func Delete(name string) error {
+	var krErr error
 	if useKeyring() {
-		_ = keyring.Delete(service, name)
+		if err := keyring.Delete(service, name); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			krErr = err
+		}
 	}
 	m, err := readFile()
 	if err != nil {
 		return err
 	}
 	if _, ok := m[name]; !ok {
-		return nil
+		// The file store needed no cleanup: a real keyring failure is an
+		// error rather than a silent success. ErrNotFound already counts as
+		// deleted above.
+		return krErr
 	}
 	delete(m, name)
 	return writeFile(m)

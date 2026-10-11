@@ -2,7 +2,6 @@ package app
 
 import (
 	"bufio"
-	"context"
 	"io"
 	"os"
 	"strconv"
@@ -13,8 +12,6 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-
-	"vpstui/internal/docker"
 )
 
 // History bounds. Trimming drops from the cap down to the floor rather than
@@ -93,6 +90,10 @@ type ContainerView struct {
 	size  int      // bytes held by lines, counting one newline per line
 	rows  []string // styled, filtered rows — what the viewport shows
 	hits  []int    // indices into rows matching query (highlight mode only)
+	// lower mirrors lines lowercased, kept in lockstep (same indices) and only
+	// while a query is active. rebuildRows matches against it so every
+	// keystroke does not re-fold the whole buffer.
+	lower []string
 
 	query     string
 	hide      bool // true: drop non-matching rows; false: keep all and bold matches
@@ -108,7 +109,6 @@ type ContainerView struct {
 	width   int
 	height  int
 
-	cancel context.CancelFunc
 	reader io.ReadCloser
 }
 
@@ -133,25 +133,17 @@ func (c *ContainerView) SetTag(display, tint string) {
 	}
 }
 
-// Open starts the remote `docker logs -f` stream; the caller pumps lines to
-// send via streamLogs.
-func (c *ContainerView) Open(dock *docker.Executor, id string) (io.ReadCloser, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	r, err := dock.StreamLogs(ctx, id, logTail())
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	c.cancel = cancel
+// Attach registers an already-opened stream. It must be called on the UI
+// goroutine (via logOpenedMsg) — the same rule Stop and Update follow.
+func (c *ContainerView) Attach(r io.ReadCloser) {
 	c.reader = r
-	return r, nil
+	c.running = true
 }
 
 func (c *ContainerView) Stop() {
-	if c.cancel != nil {
-		c.cancel()
-	}
 	if c.reader != nil {
+		// stream.Close cancels StreamExec's internal context and closes the
+		// session, which ends the remote `docker logs -f`.
 		c.reader.Close()
 	}
 	c.running = false
@@ -200,18 +192,34 @@ func (c *ContainerView) Append(chunk string) {
 	for _, line := range strings.Split(text, "\n") {
 		c.size += len(line) + 1
 		c.lines = append(c.lines, line)
+		if c.lower != nil {
+			c.lower = append(c.lower, strings.ToLower(line))
+		}
 	}
 	if c.size > logBytesCap || len(c.lines) > logLinesCap {
 		c.trimHistory()
 		return
 	}
-	for _, line := range c.lines[start:] {
-		c.pushRow(line)
+	qlow := ""
+	if c.query != "" {
+		c.ensureLower()
+		qlow = strings.ToLower(c.query)
+	}
+	for i := start; i < len(c.lines); i++ {
+		low := ""
+		if qlow != "" {
+			low = c.lower[i]
+		}
+		c.pushRow(c.lines[i], low, qlow)
 	}
 }
 
-func (c *ContainerView) pushRow(line string) {
-	if c.query != "" && !containsFold(line, c.query) {
+// pushRow styles and appends one freshly arrived line. low is the lowered line
+// (valid whenever qlow is set) and qlow the lowered query, precomputed once per
+// Append instead of per line.
+func (c *ContainerView) pushRow(line, low, qlow string) {
+	matched := qlow == "" || strings.Contains(low, qlow)
+	if !matched {
 		if c.hide {
 			return
 		}
@@ -219,14 +227,28 @@ func (c *ContainerView) pushRow(line string) {
 		c.dirty = true
 		return
 	}
-	c.rows = append(c.rows, styleLine(line, c.query, !c.hide && c.query != ""))
-	if !c.hide && c.query != "" {
+	c.rows = append(c.rows, styleLine(line, c.query, qlow != "" && !c.hide))
+	if qlow != "" && !c.hide {
 		c.hits = append(c.hits, len(c.rows)-1)
 	}
 	if !c.follow {
 		c.pending++
 	}
 	c.dirty = true
+}
+
+// ensureLower makes the lowered mirror exactly as long as lines, backfilling
+// anything missing. The mirror is only maintained while a query is active;
+// without one the per-line ToLower would be paid for nothing.
+func (c *ContainerView) ensureLower() {
+	if c.query == "" || len(c.lower) == len(c.lines) {
+		return
+	}
+	grow := make([]string, len(c.lines)-len(c.lower))
+	for i, line := range c.lines[len(c.lower):] {
+		grow[i] = strings.ToLower(line)
+	}
+	c.lower = append(c.lower, grow...)
 }
 
 // trimHistory drops whole lines until the floors are met, then rebuilds every
@@ -240,6 +262,9 @@ func (c *ContainerView) trimHistory() {
 	}
 	if drop > 0 {
 		c.lines = append(c.lines[:0], c.lines[drop:]...)
+		if c.lower != nil {
+			c.lower = append(c.lower[:0], c.lower[drop:]...)
+		}
 	}
 	c.rebuildRows()
 }
@@ -252,12 +277,17 @@ func (c *ContainerView) rebuildRows() {
 	if c.dropped {
 		rows = append(rows, logMarkerRow)
 	}
-	for _, line := range c.lines {
-		matched := c.query == "" || containsFold(line, c.query)
+	var qlow string
+	if c.query != "" {
+		c.ensureLower()
+		qlow = strings.ToLower(c.query)
+	}
+	for i, line := range c.lines {
+		matched := qlow == "" || strings.Contains(c.lower[i], qlow)
 		if !matched && c.hide {
 			continue
 		}
-		mark := matched && !c.hide && c.query != ""
+		mark := matched && qlow != "" && !c.hide
 		if mark {
 			hits = append(hits, len(rows))
 		}
@@ -289,6 +319,10 @@ func (c *ContainerView) applyQuery(q string) {
 		return
 	}
 	c.query = q
+	if q == "" {
+		// No active query, no lowered mirror: stop paying for the second copy.
+		c.lower = nil
+	}
 	c.rebuildRows()
 }
 
@@ -528,20 +562,6 @@ func logLevel(s string) logSev {
 
 func isASCIILetter(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
-}
-
-// containsFold is byte-window case folding, shared with highlightLine so a row
-// counts as a hit exactly when something in it gets bolded.
-func containsFold(s, sub string) bool {
-	if sub == "" {
-		return false
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if strings.EqualFold(s[i:i+len(sub)], sub) {
-			return true
-		}
-	}
-	return false
 }
 
 // highlightLine bolds each occurrence of query. Segments are rendered apart so

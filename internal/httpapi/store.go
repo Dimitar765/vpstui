@@ -126,30 +126,32 @@ func (s *Store) Unpublish(id string) {
 	delete(s.sessions, id)
 }
 
-// Get returns the snapshot for id.
-func (s *Store) Get(id string) (SessionSnapshot, bool) {
+// GetIfOpen resolves id under one read lock, so a Close racing the request
+// cannot turn a live session into a 404 (the old IsClosed-then-Get pair
+// could). open distinguishes the 503 case from a plain miss.
+func (s *Store) GetIfOpen(id string) (snap SessionSnapshot, open, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	snap, ok := s.sessions[id]
-	return snap, ok
+	if s.closed {
+		return SessionSnapshot{}, false, false
+	}
+	snap, ok = s.sessions[id]
+	return snap, true, ok
 }
 
-// All returns every snapshot; callers own the returned slice.
-func (s *Store) All() []SessionSnapshot {
+// AllIfOpen returns every snapshot under one read lock, with the same shape as
+// GetIfOpen. callers own the returned slice.
+func (s *Store) AllIfOpen() (snaps []SessionSnapshot, open bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.closed {
+		return nil, false
+	}
 	out := make([]SessionSnapshot, 0, len(s.sessions))
 	for _, snap := range s.sessions {
 		out = append(out, snap)
 	}
-	return out
-}
-
-// IsClosed reports whether the store was closed by the TUI exiting.
-func (s *Store) IsClosed() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.closed
+	return out, true
 }
 
 // Close marks the store closed so late requests return 503. Non-blocking.

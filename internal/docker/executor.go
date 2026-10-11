@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -38,13 +39,18 @@ func (e *Executor) exec(ctx context.Context, timeout time.Duration, cmd string) 
 }
 
 func friendly(stderr string, err error) error {
+	// The typed connection-loss signal must reach the app layer intact — the
+	// auto-retry keys on errors.Is — so it passes through untransformed.
+	if errors.Is(err, sshclient.ErrConnLost) {
+		return err
+	}
 	low := strings.ToLower(stderr)
 	switch {
 	case strings.Contains(low, "command not found"):
 		return fmt.Errorf("docker is not installed or not in PATH on this host")
 	case strings.Contains(low, "cannot connect to the docker daemon"):
 		return fmt.Errorf("docker daemon is not running on this host")
-	case strings.Contains(low, "permission denied") && strings.Contains(low, "docker"):
+	case strings.Contains(low, "permission denied while trying to connect to the docker daemon socket"):
 		return fmt.Errorf("permission denied accessing /var/run/docker.sock — add the user to the docker group")
 	case strings.Contains(err.Error(), "context deadline exceeded"):
 		return fmt.Errorf("command timed out: %w", err)
@@ -68,18 +74,39 @@ type psJSON struct {
 	Networks  string `json:"Networks"`
 }
 
-func (e *Executor) ListContainers(ctx context.Context) ([]models.Container, error) {
-	out, err := e.exec(ctx, 15*time.Second, `docker ps -a --format '{{json .}}'`)
-	if err != nil {
-		return nil, err
+// snapshotCmd fetches the container list, per-container stats and host
+// metrics in one shell invocation. Sections are separated by \x1e (ASCII
+// record separator), which `{{json .}}` output cannot contain — JSON escapes
+// control characters — and the /proc text never produces. `docker stats`
+// failing inside the batch is tolerated (`|| true`), matching the standalone
+// stats probe whose error its caller discards; a `docker ps` failure
+// propagates via exit $rc exactly as the standalone list did.
+const snapshotCmd = `sh -c 'docker ps -a --format "{{json .}}"; rc=$?; printf "\036"; docker stats --no-stream --format "{{json .}}" || true; printf "\036"; cat /proc/loadavg; cat /proc/uptime; grep -E "^Mem(Total|Available):" /proc/meminfo; nproc; exit $rc'`
+
+// parseSnapshot splits and parses a snapshotCmd payload: list NDJSON, stats
+// NDJSON, then the /proc text, separated by \x1e.
+func parseSnapshot(out string) ([]models.Container, []models.ContainerStats, models.HostStats, error) {
+	parts := strings.Split(out, "\x1e")
+	if len(parts) != 3 {
+		return nil, nil, models.HostStats{}, fmt.Errorf("snapshot: expected 3 sections, got %d", len(parts))
 	}
-	return parsePs(out), nil
+	return parsePs(parts[0]), parseStats(parts[1]), parseHostStats(parts[2]), nil
+}
+
+// Snapshot fetches container list, stats and host metrics in one round trip.
+// The three execs this replaces used to cost the dashboard three sequential
+// SSH execs every 2 s tick.
+func (e *Executor) Snapshot(ctx context.Context) ([]models.Container, []models.ContainerStats, models.HostStats, error) {
+	out, err := e.exec(ctx, 15*time.Second, snapshotCmd)
+	if err != nil {
+		return nil, nil, models.HostStats{}, err
+	}
+	return parseSnapshot(out)
 }
 
 // parsePs parses the NDJSON produced by `docker ps -a --format '{{json .}}'`.
-// Extracted from ListContainers to make it testable. Its IDs are docker's
-// 12-char short form, which is the app's canonical container id everywhere:
-// the table, action args, and graph node ids.
+// Its IDs are docker's 12-char short form, which is the app's canonical
+// container id everywhere: the table, action args, and graph node ids.
 func parsePs(out string) []models.Container {
 	var res []models.Container
 	for _, line := range strings.Split(out, "\n") {
@@ -113,11 +140,10 @@ type statsJSON struct {
 	MemPerc  string `json:"MemPerc"`
 }
 
-func (e *Executor) ContainerStats(ctx context.Context) ([]models.ContainerStats, error) {
-	out, err := e.exec(ctx, 15*time.Second, `docker stats --no-stream --format '{{json .}}'`)
-	if err != nil {
-		return nil, err
-	}
+// parseStats parses the NDJSON produced by
+// `docker stats --no-stream --format '{{json .}}'`, the format both
+// ContainerStats and Snapshot consume.
+func parseStats(out string) []models.ContainerStats {
 	var res []models.ContainerStats
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
@@ -133,20 +159,19 @@ func (e *Executor) ContainerStats(ctx context.Context) ([]models.ContainerStats,
 			MemUsage: j.MemUsage, MemPerc: j.MemPerc,
 		})
 	}
-	return res, nil
+	return res
 }
 
-func (e *Executor) HostStats(ctx context.Context) (models.HostStats, error) {
-	cmd := `sh -c 'cat /proc/loadavg; cat /proc/uptime; grep -E "^Mem(Total|Available):" /proc/meminfo; nproc'`
-	out, err := e.exec(ctx, 10*time.Second, cmd)
+func (e *Executor) ContainerStats(ctx context.Context) ([]models.ContainerStats, error) {
+	out, err := e.exec(ctx, 15*time.Second, `docker stats --no-stream --format '{{json .}}'`)
 	if err != nil {
-		return models.HostStats{}, err
+		return nil, err
 	}
-	return parseHostStats(out), nil
+	return parseStats(out), nil
 }
 
-// parseHostStats parses the stdout produced by the HostStats probe command.
-// Extracted from HostStats without behavior change to make it testable.
+// parseHostStats parses the stdout produced by the /proc section of
+// snapshotCmd. Extracted to make it testable.
 func parseHostStats(out string) models.HostStats {
 	var hs models.HostStats
 	for _, line := range strings.Split(out, "\n") {

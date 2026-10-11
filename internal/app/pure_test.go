@@ -9,34 +9,6 @@ import (
 	"vpstui/internal/models"
 )
 
-func TestLooksLikeConnLoss(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want bool
-	}{
-		{"connection lost", "ssh: connection lost", true},
-		{"case insensitive connection lost", "CONNECTION LOST", true},
-		{"use of closed", "write tcp: use of closed network connection", true},
-		{"eof exact", "EOF", true},
-		{"eof lowercase in sentence", "unexpected end of file: read EOF from server", true},
-		{"broken pipe", "write: broken pipe", true},
-		{"no such host", "dial tcp: lookup vps: no such host", true},
-		{"tcp connect", "dial tcp connect: connection refused", true},
-		{"docker error is not conn loss", "docker is not installed or not in PATH on this host", false},
-		{"permission error is not conn loss", "permission denied accessing /var/run/docker.sock", false},
-		{"empty string", "", false},
-		{"timeout message", "command timed out", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := looksLikeConnLoss(tt.in); got != tt.want {
-				t.Errorf("looksLikeConnLoss(%q) = %v, want %v", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestFmtDuration(t *testing.T) {
 	tests := []struct {
 		name string
@@ -184,29 +156,6 @@ func TestParseLogTail(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := parseLogTail(tt.in); got != tt.want {
 				t.Errorf("parseLogTail(%q) = %d, want %d", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestContainsFold(t *testing.T) {
-	tests := []struct {
-		name string
-		s    string
-		sub  string
-		want bool
-	}{
-		{"plain", "GET /health 200", "health", true},
-		{"case differs", "GET /Health 200", "health", true},
-		{"absent", "GET /health 200", "500", false},
-		{"empty sub never matches", "abc", "", false},
-		{"sub longer than s", "ab", "abc", false},
-		{"exact", "err", "err", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := containsFold(tt.s, tt.sub); got != tt.want {
-				t.Errorf("containsFold(%q, %q) = %v, want %v", tt.s, tt.sub, got, tt.want)
 			}
 		})
 	}

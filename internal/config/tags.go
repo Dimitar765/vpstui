@@ -39,7 +39,8 @@ func LoadTags() (map[string]models.Tag, error) {
 	}
 	var tags map[string]models.Tag
 	if err := json.Unmarshal(data, &tags); err != nil {
-		return nil, fmt.Errorf("corrupt tags file %s: %w", p, err)
+		renameAside(p)
+		return nil, fmt.Errorf("corrupt tags file %s — renamed to %s.bad: %w", p, p, err)
 	}
 	return tags, nil
 }

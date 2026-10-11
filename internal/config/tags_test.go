@@ -74,6 +74,44 @@ func TestSaveTagsEmptyIsNotAnError(t *testing.T) {
 	}
 }
 
+// Same guarantee as hosts: the unreadable file is preserved as <path>.bad and
+// a later SaveTags writes a fresh file without touching the backup.
+func TestLoadTagsCorruptFileIsRenamedAsideNotOverwritten(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	p, err := tagsPath()
+	if err != nil {
+		t.Fatalf("tagsPath: %v", err)
+	}
+	garbage := []byte("this is not json")
+	if err := os.WriteFile(p, garbage, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := LoadTags(); err == nil || !strings.Contains(err.Error(), "renamed") {
+		t.Fatalf("LoadTags error = %v, want it to mention renamed", err)
+	}
+	bad, err := os.ReadFile(p + ".bad")
+	if err != nil {
+		t.Fatalf("ReadFile(.bad): %v", err)
+	}
+	if !bytes.Equal(bad, garbage) {
+		t.Fatalf(".bad = %q, want the original bytes %q", bad, garbage)
+	}
+	if err := SaveTags(sampleTags()); err != nil {
+		t.Fatalf("SaveTags: %v", err)
+	}
+	after, err := os.ReadFile(p + ".bad")
+	if err != nil {
+		t.Fatalf(".bad vanished after SaveTags: %v", err)
+	}
+	if !bytes.Equal(after, garbage) {
+		t.Fatalf(".bad changed after SaveTags: %q", after)
+	}
+	if _, err := LoadTags(); err != nil {
+		t.Fatalf("LoadTags after fresh SaveTags: %v", err)
+	}
+}
+
 func TestLoadTagsCorruptFile(t *testing.T) {
 	tests := []struct {
 		name string

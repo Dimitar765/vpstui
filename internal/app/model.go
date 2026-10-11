@@ -3,7 +3,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -77,6 +79,41 @@ type logChunkMsg struct {
 type logEndMsg struct {
 	msgTag
 	err error
+}
+
+// logOpenedMsg carries an opened log stream to the UI goroutine, which alone
+// may set cv.reader (Attach). Opening used to happen inside the cmd goroutine
+// and raced cv.Stop/cv.Update on those fields.
+type logOpenedMsg struct {
+	msgTag
+	reader io.ReadCloser
+}
+
+// retryMsg fires once, retryAfter after a typed connection loss, to redial the
+// session whose dashboard showed the banner. Log-stream drops are not retried;
+// the user reopens the stream.
+type retryMsg struct {
+	msgTag
+}
+
+// retryAfter paces the single automatic reconnect. A var so tests can shrink it.
+var retryAfter = 5 * time.Second
+
+// persistDoneMsg reports the outcome of a config/secret write that ran off the
+// UI goroutine. Success feedback is synchronous at the call site; only
+// failures come back here.
+type persistDoneMsg struct {
+	what string
+	err  error
+}
+
+// persistCmd runs a blocking file/keyring write in its own goroutine, so a
+// hung keyring daemon cannot freeze the UI thread. fn must only touch values
+// captured before the call — never live model state.
+func persistCmd(what string, fn func() error) tea.Cmd {
+	return func() tea.Msg {
+		return persistDoneMsg{what: what, err: fn()}
+	}
 }
 
 // logFlushMsg batches the rows Append recorded, so the viewport pays one
@@ -153,6 +190,11 @@ type Session struct {
 	// perfArmed guarantees one 10 s stats-only chain per session generation,
 	// the same once-per-generation guarantee errArmed gives the log sweep.
 	perfArmed bool
+
+	// retried limits the automatic reconnect to one attempt per generation:
+	// the first typed connection loss arms a ~5s redial, a second loss leaves
+	// the manual "press c" banner. Reset when a connect succeeds.
+	retried bool
 }
 
 type Model struct {
@@ -309,7 +351,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, errLoadedMsg, shellExitedMsg, shellProbeDoneMsg, peaksLoadedMsg, perfTickMsg, perfLoadedMsg:
+	case persistDoneMsg:
+		return m.onPersistDone(msg)
+
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logOpenedMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, errLoadedMsg, shellExitedMsg, shellProbeDoneMsg, peaksLoadedMsg, perfTickMsg, perfLoadedMsg, retryMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -351,6 +396,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.view == viewHosts {
+		// Status expiry is an Update-time event, like the dashboard toast:
+		// the line survives repaints and clears on the next keypress.
+		m.status = ""
+	}
 	switch m.view {
 	case viewHosts:
 		if msg.String() == "q" {
@@ -387,14 +437,17 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			h := m.pendingHost
 			s := next.SecretValue()
 			m.form = nil
+			var cmd tea.Cmd
 			if s != "" {
 				ref := h.PasswordRef()
 				if h.AuthType == models.AuthKey {
 					ref = h.PassphraseRef()
 				}
-				_ = secret.Set(ref, s)
+				// The dial carries the secret itself; storage happens beside
+				// it, off the UI thread.
+				cmd = persistCmd("storing the secret", func() error { return secret.Set(ref, s) })
 			}
-			return m, m.dialCmd(h, m.pendingGen, s)
+			return m, tea.Batch(cmd, m.dialCmd(h, m.pendingGen, s))
 		}
 		if cancelled {
 			m.form = nil
@@ -715,8 +768,7 @@ func (m *Model) untagCursor() (tea.Model, tea.Cmd) {
 		m.tagFeedback(t.name+" has no tag", false)
 		return m, nil
 	}
-	m.afterTagChange(t.hostID, "tag cleared from "+t.name, false)
-	return m, nil
+	return m, m.afterTagChange(t.hostID, "tag cleared from "+t.name, false)
 }
 
 // updateTag runs the prompt. Every key it consumes is stopped here, so nothing
@@ -725,7 +777,7 @@ func (m *Model) updateTag(msg tea.Msg) (tea.Model, tea.Cmd) {
 	outcome, cmd := m.tag.Update(msg)
 	switch outcome {
 	case promptCommit:
-		m.commitTag()
+		cmd = m.commitTag()
 	default:
 		// The prompt row is a pre-rendered string, so every keystroke that keeps
 		// it open has to refresh it — otherwise the field looks dead while typing.
@@ -737,37 +789,35 @@ func (m *Model) updateTag(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) commitTag() {
+func (m *Model) commitTag() tea.Cmd {
 	t := m.tag.target
 	label, ok := m.tag.value()
 	if !ok {
 		// Emptied (or nothing but separators): the prefilled label was deleted on
 		// purpose, so this is an untag.
 		if m.tags.Clear(t.hostID, t.name) {
-			m.afterTagChange(t.hostID, "tag cleared from "+t.name, false)
-			return
+			return m.afterTagChange(t.hostID, "tag cleared from "+t.name, false)
 		}
 		m.tagFeedback("tag needs some text", true)
-		return
+		return nil
 	}
 	if m.tags.Set(t.hostID, t.name, label, m.tag.color, t.id) {
-		m.afterTagChange(t.hostID, "tagged "+t.name+" as "+label, false)
-		return
+		return m.afterTagChange(t.hostID, "tagged "+t.name+" as "+label, false)
 	}
 	m.syncTagPrompt()
+	return nil
 }
 
 // afterTagChange persists the label and repaints every surface that shows it.
-// The save is the only part that can fail, and its error goes to the same place
-// as the success message.
-func (m *Model) afterTagChange(hostID, msg string, isErr bool) {
-	if err := config.SaveTags(m.tags.All()); err != nil {
-		msg, isErr = "could not save tags: "+err.Error(), true
-	}
+// The success message goes out synchronously; the write itself runs off the UI
+// thread and reports failures via persistDoneMsg next to it.
+func (m *Model) afterTagChange(hostID, msg string, isErr bool) tea.Cmd {
+	tags := m.tags.All()
 	m.repaintTag(hostID)
 	// Last, because refreshing the Errors screen clears a note set before it.
 	m.tagFeedback(msg, isErr)
 	m.syncTagPrompt()
+	return persistCmd("saving tags", func() error { return config.SaveTags(tags) })
 }
 
 // repaintTag redraws every surface that reads labels, for the host whose label
@@ -829,6 +879,8 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case logEndMsg:
 		t = msg.msgTag
+	case logOpenedMsg:
+		t = msg.msgTag
 	case logFlushMsg:
 		t = msg.msgTag
 	case detailLoadedMsg:
@@ -841,6 +893,8 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case perfTickMsg:
 		t = msg.msgTag
+	case retryMsg:
+		t = msg.msgTag
 	case perfLoadedMsg:
 		t = msg.msgTag
 	case shellExitedMsg:
@@ -850,6 +904,11 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	s := m.findSession(t.hostID, t.gen)
 	if s == nil {
+		// A stream that opens after its session is gone would otherwise leak;
+		// close it instead of attaching nowhere.
+		if lo, ok := msg.(logOpenedMsg); ok {
+			lo.reader.Close()
+		}
 		return m, nil // stale
 	}
 	switch msg := msg.(type) {
@@ -879,10 +938,25 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 						cmds = append(cmds, c)
 					}
 				}
+			} else if msg.err != nil && errors.Is(msg.err, sshclient.ErrConnLost) && !s.retried {
+				// First typed loss on this generation: redial once, ~5s out.
+				// A retry failure or a second loss leaves the "press c" banner
+				// that Dashboard.Update just raised.
+				s.retried = true
+				cmds = append(cmds, tea.Tick(retryAfter, func(time.Time) tea.Msg {
+					return retryMsg{msgTag: t}
+				}))
 			}
 			if len(cmds) > 0 {
 				return m, tea.Batch(cmds...)
 			}
+		}
+		return m, nil
+	case retryMsg:
+		// The dashboard is gone if reconnect already ran; disconnected is false
+		// if the session recovered (or the user pressed c) before we fired.
+		if s.dash != nil && s.dash.disconnected {
+			return m.reconnect(s)
 		}
 		return m, nil
 	case errLoadedMsg:
@@ -928,6 +1002,13 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 			s.cv.Append(msg.chunk)
 		}
 		return m, nil
+	case logOpenedMsg:
+		if s.cv != nil {
+			s.cv.Attach(msg.reader)
+		} else {
+			msg.reader.Close()
+		}
+		return m, tickLogs(t.hostID, t.gen)
 	case logEndMsg:
 		if s.cv != nil {
 			s.cv.StreamDone(msg.err)
@@ -1016,7 +1097,6 @@ func (m *Model) View() string {
 		body := styleTitle.Render("vpstui — VPS & containers over SSH") + "\n\n" + m.list.View()
 		if m.status != "" {
 			body += "\n" + styleWarn.Render(m.status)
-			m.status = ""
 		}
 		return pinFooter(body, helpLine("↑/↓ j/k", "move", "n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.width, m.height)
 	case viewForm, viewPrompt:
@@ -1125,11 +1205,20 @@ func (m *Model) deleteHost(h models.Host) (tea.Model, tea.Cmd) {
 		}
 	}
 	m.hosts = out
-	_ = secret.Delete(h.PasswordRef())
-	_ = secret.Delete(h.PassphraseRef())
-	if err := config.Save(m.hosts); err != nil {
-		m.status = "could not save hosts: " + err.Error()
-	}
+	// The write and secret cleanup run off the UI thread; both refs are for the
+	// same removal, so the first failure reports.
+	pwRef, ppRef := h.PasswordRef(), h.PassphraseRef()
+	hosts := make([]models.Host, len(m.hosts))
+	copy(hosts, m.hosts)
+	cmd = tea.Batch(cmd, persistCmd("saving hosts", func() error {
+		if err := secret.Delete(pwRef); err != nil {
+			return err
+		}
+		if err := secret.Delete(ppRef); err != nil {
+			return err
+		}
+		return config.Save(hosts)
+	}))
 	m.list.SetItems(m.hosts)
 	m.refreshConnected()
 	return m, cmd
@@ -1146,21 +1235,22 @@ func (m *Model) saveHost(msg formSubmittedMsg) (tea.Model, tea.Cmd) {
 	if !replaced {
 		m.hosts = append(m.hosts, msg.host)
 	}
-	if err := config.Save(m.hosts); err != nil {
-		m.status = "could not save hosts: " + err.Error()
-	}
+	// The write and the secret storage run off the UI thread; failures arrive
+	// as persistDoneMsg and land in the same status row the sync errors used.
+	hosts := make([]models.Host, len(m.hosts))
+	copy(hosts, m.hosts)
+	var cmd tea.Cmd = persistCmd("saving hosts", func() error { return config.Save(hosts) })
 	if msg.secretV != "" {
 		ref := msg.host.PasswordRef()
 		if msg.host.AuthType == models.AuthKey {
 			ref = msg.host.PassphraseRef()
 		}
-		if err := secret.Set(ref, msg.secretV); err != nil {
-			m.status = "host saved, but secret storage failed: " + err.Error()
-		}
+		secretV := msg.secretV
+		cmd = tea.Batch(cmd, persistCmd("storing the secret", func() error { return secret.Set(ref, secretV) }))
 	}
 	m.form = nil
 	m.list.SetItems(m.hosts)
-	return m, nil
+	return m, cmd
 }
 
 func (m *Model) startConnect(h models.Host) (tea.Model, tea.Cmd) {
@@ -1247,6 +1337,7 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	s.conn = msg.conn
+	s.retried = false // a fresh generation earns its one automatic retry back
 	s.dock = docker.New(msg.conn)
 	s.dash = NewDashboard(msg.host, s.dock, m.width, m.height-m.tabRows(), msg.gen)
 	s.dash.SetTags(m.tags)
@@ -1272,17 +1363,35 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// onPersistDone surfaces a background write failure where the user is looking.
+// A success toast for the same operation may already be on screen — known and
+// accepted: the correction lands moments later, and the writes are atomic.
+func (m *Model) onPersistDone(msg persistDoneMsg) (tea.Model, tea.Cmd) {
+	if msg.err == nil {
+		return m, nil
+	}
+	if m.view == viewDashboard {
+		if s := m.activeSession(); s != nil && s.dash != nil {
+			s.dash.SetToast(msg.what+" failed: "+msg.err.Error(), true)
+			return m, nil
+		}
+	}
+	m.status = msg.what + " failed: " + msg.err.Error()
+	return m, nil
+}
+
 func startLogStream(s *Session, id string, send func(tea.Msg)) tea.Cmd {
 	dock := s.dock
 	t := msgTag{hostID: s.host.ID, gen: s.gen}
 	return func() tea.Msg {
-		r, err := s.cv.Open(dock, id)
+		// Opened entirely in this cmd goroutine; the reader is handed to the
+		// UI goroutine via logOpenedMsg, so cv.reader is only touched there.
+		r, err := dock.StreamLogs(context.Background(), id, logTail())
 		if err != nil {
 			return logEndMsg{msgTag: t, err: err}
 		}
 		go streamLogs(r, send, t)
-		// Kick the flush chain; it reschedules itself while the stream lives.
-		return tickLogs(t.hostID, t.gen)
+		return logOpenedMsg{msgTag: t, reader: r}
 	}
 }
 

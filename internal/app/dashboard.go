@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"vpstui/internal/docker"
 	"vpstui/internal/models"
 	"vpstui/internal/perf"
+	"vpstui/internal/sshclient"
 )
 
 type containerReq struct {
@@ -110,6 +112,12 @@ type Dashboard struct {
 	logReq        *containerReq
 	shellReq      *containerReq
 	shellBusy     bool
+
+	// fetchBusy guards the 2 s foreground chain: fetchNow is a no-op while a
+	// snapshot is in flight, so a slow host cannot stack round trips under the
+	// next tick. Safe against stale-tag drops because every (re)connect mints
+	// a fresh Dashboard — a stuck flag dies with its generation.
+	fetchBusy bool
 }
 
 var dashCols = []ctableCol{
@@ -280,18 +288,21 @@ func (d *Dashboard) selectedProject() (string, bool) {
 }
 
 func (d *Dashboard) fetchNow() tea.Cmd {
+	if d.dock == nil || d.fetchBusy {
+		return nil
+	}
+	d.fetchBusy = true
 	dock := d.dock
 	t := msgTag{hostID: d.hostID, gen: d.gen}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		containers, err := dock.ListContainers(ctx)
-		if err != nil {
-			return statsLoadedMsg{msgTag: t, err: err}
-		}
-		cstats, _ := dock.ContainerStats(ctx)
-		hstats, herr := dock.HostStats(ctx)
-		return statsLoadedMsg{msgTag: t, containers: containers, listOK: true, cstats: cstats, hstats: hstats, err: herr}
+		// One SSH exec carries the list, the stats and the /proc probe; a
+		// failed `docker ps` fails the whole tick, a failed `docker stats`
+		// inside the batch arrives as empty cstats exactly as the old
+		// discarded error did.
+		containers, cstats, hstats, err := dock.Snapshot(ctx)
+		return statsLoadedMsg{msgTag: t, containers: containers, listOK: err == nil, cstats: cstats, hstats: hstats, err: err}
 	}
 }
 
@@ -344,12 +355,16 @@ func (d *Dashboard) probeShell(req containerReq) tea.Cmd {
 func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 	switch msg := msg.(type) {
 	case statsTickMsg:
+		// Toast expiry is an Update-time event: the toast survives repaints
+		// and clears on the next 2 s tick. View stays side-effect free.
+		d.toast = ""
 		return d, nil // root re-schedules the fetch chain
 
 	case statsLoadedMsg:
+		d.fetchBusy = false // first statement: cleared on success and error arms alike
 		if !msg.listOK {
 			d.errMsg = msg.err.Error()
-			if looksLikeConnLoss(msg.err.Error()) {
+			if errors.Is(msg.err, sshclient.ErrConnLost) {
 				d.disconnected = true
 			}
 			return d, nil
@@ -654,16 +669,6 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 	return d, cmd
 }
 
-func looksLikeConnLoss(s string) bool {
-	low := strings.ToLower(s)
-	return strings.Contains(low, "connection lost") ||
-		strings.Contains(low, "use of closed") ||
-		strings.Contains(low, "eof") ||
-		strings.Contains(low, "broken pipe") ||
-		strings.Contains(low, "no such host") ||
-		strings.Contains(low, "tcp connect")
-}
-
 func (d *Dashboard) rebuild() {
 	cur := d.tbl.Cursor()
 
@@ -830,7 +835,6 @@ func (d *Dashboard) View() string {
 		} else {
 			b.WriteString(styleOK.Render(d.toast) + "\n")
 		}
-		d.toast = ""
 	}
 	if d.errMsg != "" {
 		b.WriteString(styleErr.Render(d.errMsg) + "\n")

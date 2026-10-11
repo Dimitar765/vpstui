@@ -25,13 +25,8 @@ func (h *handler) index(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	page, err := web.ReadFile("web/index.html")
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "dashboard unavailable"})
-		return
-	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(page)
+	_, _ = w.Write(indexHTML)
 }
 
 func (h *handler) unavailable(w http.ResponseWriter) {
@@ -39,11 +34,11 @@ func (h *handler) unavailable(w http.ResponseWriter) {
 }
 
 func (h *handler) listSessions(w http.ResponseWriter, _ *http.Request) {
-	if h.store.IsClosed() {
+	snaps, open := h.store.AllIfOpen()
+	if !open {
 		h.unavailable(w)
 		return
 	}
-	snaps := h.store.All()
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].Name < snaps[j].Name })
 	out := make([]sessionSummaryJSON, 0, len(snaps))
 	for _, s := range snaps {
@@ -53,11 +48,11 @@ func (h *handler) listSessions(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *handler) getSession(w http.ResponseWriter, r *http.Request) {
-	if h.store.IsClosed() {
+	snap, open, ok := h.store.GetIfOpen(r.PathValue("id"))
+	if !open {
 		h.unavailable(w)
 		return
 	}
-	snap, ok := h.store.Get(r.PathValue("id"))
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 		return
@@ -68,11 +63,11 @@ func (h *handler) getSession(w http.ResponseWriter, r *http.Request) {
 // getNetwork serves the container↔network graph. It is a separate endpoint so
 // the sessions poll never carries graph bytes while only the table is shown.
 func (h *handler) getNetwork(w http.ResponseWriter, r *http.Request) {
-	if h.store.IsClosed() {
+	snap, open, ok := h.store.GetIfOpen(r.PathValue("id"))
+	if !open {
 		h.unavailable(w)
 		return
 	}
-	snap, ok := h.store.Get(r.PathValue("id"))
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 		return
@@ -84,9 +79,10 @@ func (h *handler) getNetwork(w http.ResponseWriter, r *http.Request) {
 // TUI already published, so one request costs a read lock and a sort — never an
 // SSH round trip, and never a second opinion about what counted as an error.
 func (h *handler) getErrors(w http.ResponseWriter, _ *http.Request) {
-	if h.store.IsClosed() {
+	snaps, open := h.store.AllIfOpen()
+	if !open {
 		h.unavailable(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, toErrorsJSON(h.store.All()))
+	writeJSON(w, http.StatusOK, toErrorsJSON(snaps))
 }

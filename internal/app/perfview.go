@@ -142,7 +142,8 @@ func (d *Dashboard) fetchPeaks() tea.Cmd {
 
 // fetchPerf samples docker stats only — no container list, no /proc probe. Root
 // arms it every 10 s for a session whose dashboard is not on screen, which is
-// 0.1 SSH round trips a second against the 1.5/s an open dashboard already makes.
+// 0.1 SSH round trips a second against the ~0.5/s an open dashboard costs now
+// that its 2 s tick is a single batched exec.
 // perfBusy keeps a slow round trip from being stacked under the next tick.
 func (d *Dashboard) fetchPerf() tea.Cmd {
 	if d.dock == nil || d.perfBusy {

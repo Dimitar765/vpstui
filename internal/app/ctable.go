@@ -27,6 +27,10 @@ type ctableCol struct {
 	title string
 	width int
 	kind  cellKind
+	// style is the prebuilt Width/MaxWidth/Inline renderer for this column's
+	// cells and header title. Built once by SetColumns; a View-time
+	// lipgloss.NewStyle per cell per frame is measurable at dashboard rates.
+	style lipgloss.Style
 }
 
 // ctable is a minimal fixed-column table with per-column value styling.
@@ -42,9 +46,34 @@ type ctable struct {
 	offset int
 	width  int
 	height int
+
+	// Render caches, rebuilt by SetColumns: the styled header line and the
+	// summed column width the cursor-row pad needs. View used to rebuild the
+	// header per frame and re-measure the width on every cursor row.
+	headerLine string
+	totalW     int
 }
 
-func (t *ctable) SetColumns(cols []ctableCol) { t.cols = cols }
+func (t *ctable) SetColumns(cols []ctableCol) {
+	t.cols = cols
+	t.headerLine, t.totalW = "", 0
+	if len(cols) == 0 {
+		return
+	}
+	parts := make([]string, len(cols))
+	for i := range t.cols {
+		c := &t.cols[i]
+		c.style = lipgloss.NewStyle().Width(c.width).MaxWidth(c.width).Inline(true)
+		// Padded exactly as renderRow pads a cell, or the labels would sit
+		// left-packed above columns that start much further right.
+		parts[i] = c.style.Render(fitPlain(c.title, c.width))
+		t.totalW += c.width
+		if i > 0 {
+			t.totalW += cellGap
+		}
+	}
+	t.headerLine = styleTableHeader.Render(strings.Join(parts, cellGapStr))
+}
 
 // SetTint gives the rows their tag colours. It is set alongside SetRows by the
 // views that use cellTag, and may be nil.
@@ -118,39 +147,25 @@ func (t ctable) Update(msg tea.Msg) (ctable, tea.Cmd) {
 	return t, nil
 }
 
-func (t ctable) totalWidth() int {
-	var w int
-	for i, c := range t.cols {
-		w += c.width
-		if i > 0 {
-			w += cellGap
-		}
-	}
-	return w
-}
+func (t ctable) totalWidth() int { return t.totalW }
 
 // cellGap mirrors the padding the previous bubbles table put between cells.
 const cellGap = 2
+
+var cellGapStr = strings.Repeat(" ", cellGap)
 
 func (t ctable) View() string {
 	if len(t.rows) == 0 || len(t.cols) == 0 {
 		return ""
 	}
-	parts := make([]string, len(t.cols))
-	for i, c := range t.cols {
-		// Padded exactly as renderRow pads a cell, or the labels would sit
-		// left-packed above columns that start much further right.
-		parts[i] = lipgloss.NewStyle().Width(c.width).MaxWidth(c.width).Inline(true).
-			Render(fitPlain(c.title, c.width))
-	}
 	var b strings.Builder
-	b.WriteString(styleTableHeader.Render(strings.Join(parts, strings.Repeat(" ", cellGap))) + "\n")
+	b.WriteString(t.headerLine + "\n")
 
 	end := min(t.offset+t.height, len(t.rows))
 	for i := t.offset; i < end; i++ {
 		line := t.renderRow(i)
 		if i == t.cursor {
-			pad := max(t.totalWidth()-lipgloss.Width(line), 0)
+			pad := max(t.totalW-lipgloss.Width(line), 0)
 			line = styleTableSelected.Render(line + strings.Repeat(" ", pad))
 		}
 		b.WriteString(line + "\n")
@@ -160,7 +175,8 @@ func (t ctable) View() string {
 
 func (t ctable) renderRow(i int) string {
 	parts := make([]string, len(t.cols))
-	for ci, c := range t.cols {
+	for ci := range t.cols {
+		c := &t.cols[ci]
 		v := t.rows[i][ci]
 		switch c.kind {
 		case cellState:
@@ -176,9 +192,9 @@ func (t ctable) renderRow(i int) string {
 		default:
 			v = fitPlain(v, c.width)
 		}
-		parts[ci] = lipgloss.NewStyle().Width(c.width).MaxWidth(c.width).Inline(true).Render(v)
+		parts[ci] = c.style.Render(v)
 	}
-	line := strings.Join(parts, strings.Repeat(" ", cellGap))
+	line := strings.Join(parts, cellGapStr)
 	if i < len(t.header) && t.header[i] {
 		line = styleComposeHeader.Render(line)
 	}
