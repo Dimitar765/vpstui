@@ -51,6 +51,7 @@ func NewServer(store *Store, addr string) *http.Server {
 	mux.HandleFunc("GET /", h.index)
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /api/sessions", h.listSessions)
+	mux.HandleFunc("GET /api/errors", h.getErrors)
 	mux.HandleFunc("GET /api/sessions/{id}", h.getSession)
 	mux.HandleFunc("GET /api/sessions/{id}/network", h.getNetwork)
 	return &http.Server{

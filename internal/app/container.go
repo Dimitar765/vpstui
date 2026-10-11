@@ -83,6 +83,8 @@ func levelStyle(s logSev) lipgloss.Style {
 
 type ContainerView struct {
 	id, name string
+	display  string // what the title shows: "tag name" once labelled
+	tint     string // palette name for that label, "" when untagged
 	hostID   string
 	gen      uint64
 	vp       viewport.Model
@@ -112,7 +114,7 @@ type ContainerView struct {
 
 func NewContainerView(id, name string, w, h int) *ContainerView {
 	c := &ContainerView{
-		id: id, name: name, running: true, follow: true, hide: true,
+		id: id, name: name, display: name, running: true, follow: true, hide: true,
 		width: w, height: h,
 	}
 	c.vp = viewport.New(max(w-6, 20), max(h-6, 5))
@@ -121,6 +123,14 @@ func NewContainerView(id, name string, w, h int) *ContainerView {
 	c.in.CharLimit = 64
 	c.in.Width = logQueryShowRunes
 	return c
+}
+
+// SetTag relabels the title. Root calls it when the stream opens and again after
+// a label changes, so the log view never shows a stale name.
+func (c *ContainerView) SetTag(display, tint string) {
+	if display != "" {
+		c.display, c.tint = display, tint
+	}
 }
 
 // Open starts the remote `docker logs -f` stream; the caller pumps lines to
@@ -408,7 +418,8 @@ func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
 }
 
 func (c *ContainerView) View() string {
-	title := styleTitle.Render("logs — "+c.name) + " " + styleMuted.Render("["+c.id[:min(len(c.id), 12)]+"]")
+	title := styleTitle.Render("logs — ") + tagOr(styleTitle, c.tint, c.display) +
+		" " + styleMuted.Render("["+c.id[:min(len(c.id), 12)]+"]")
 	body := panel(title, c.header()+"\n"+c.vp.View(), c.width-2)
 	return pinFooter(body, c.help(), c.width, c.height)
 }

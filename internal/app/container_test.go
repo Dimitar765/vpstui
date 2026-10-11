@@ -183,7 +183,7 @@ func TestEscapeLadder(t *testing.T) {
 }
 
 func TestTypingDigitsWhileSearchingDoesNotSwitchSession(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	a := &Session{host: host("a"), gen: 1}
 	a.dash = NewDashboard(a.host, nil, 80, 24, a.gen)
 	b := &Session{host: host("b"), gen: 1}
@@ -299,7 +299,7 @@ func pad(i int) string { return fmt.Sprintf("%02d", i) }
 // The flush tick has no explicit teardown: it reschedules itself only while the
 // stream is open or rows are unrendered, so a closed view must end the chain.
 func TestFlushTickChainStopsWhenStreamEnds(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	s := &Session{host: host("a"), gen: 7}
 	s.dash = NewDashboard(s.host, nil, 80, 24, s.gen)
 	s.cv = NewContainerView("abcdef0123456789", "web", 80, 24)

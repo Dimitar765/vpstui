@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const (
@@ -39,6 +40,18 @@ func (h Host) Addr() string {
 
 func (h Host) PasswordRef() string   { return h.ID + ":password" }
 func (h Host) PassphraseRef() string { return h.ID + ":passphrase" }
+
+// Tag is a label the user attaches to one container on one host. It lives only
+// in vpstui's own config: the container's real docker name is never changed,
+// and nothing about a tag ever reaches the daemon.
+type Tag struct {
+	HostID string    `json:"hostId"`
+	Name   string    `json:"name"` // ShortName the label was written for
+	Tag    string    `json:"tag"`
+	Color  string    `json:"color"` // palette name, see app.TagColors
+	ID     string    `json:"id"`    // container id at write time, informational
+	SetAt  time.Time `json:"setAt"`
+}
 
 type Container struct {
 	ID        string
@@ -109,6 +122,24 @@ type HostStats struct {
 	NumCPU     int
 	UptimeSec  float64
 }
+
+// ContainerPeak is one container's all-time record, as the kernel's cgroup
+// counters kept it — the peak that happened while nothing was watching.
+//
+// Every numeric field is Unknown when the host could not report it. Zero is a
+// measurement ("this container has never been throttled"); absence is not, and
+// rendering it as 0 would invent a clean bill of health.
+type ContainerPeak struct {
+	ID           string
+	MemPeakBytes int64
+	CPUUsec      int64  // cumulative CPU in microseconds
+	Throttled    int64  // nr_throttled
+	Periods      int64  // nr_periods
+	StartedAt    string // docker's State.StartedAt, "" when unknown
+}
+
+// Unknown is the "no reading" marker for ContainerPeak's counters.
+const Unknown int64 = -1
 
 type DiskObject struct {
 	Type        string

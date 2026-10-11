@@ -26,7 +26,11 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning:", err)
 	}
-	m := app.New(hosts)
+	tags, err := config.LoadTags()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+	m := app.New(hosts, tags)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	m.Attach(p.Send)
 

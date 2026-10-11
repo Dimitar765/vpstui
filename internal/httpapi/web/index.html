@@ -36,9 +36,9 @@
     font: inherit; font-size: 12px; padding: .15rem .3rem;
   }
   main { padding: 1.5rem; }
-  #sessions, #network { display: grid; gap: 1.25rem; }
+  #sessions, #network, #errors, #perf { display: grid; gap: 1.25rem; }
   /* an author display rule beats the hidden attribute, so undo it explicitly */
-  #sessions[hidden], #network[hidden] { display: none; }
+  #sessions[hidden], #network[hidden], #errors[hidden], #perf[hidden] { display: none; }
   nav { display: flex; gap: .3rem; padding: 1rem 1.5rem 0; }
   nav button {
     background: none; color: var(--dim); border: 1px solid var(--line); border-bottom: 0;
@@ -64,6 +64,13 @@
   .badge { font-size: 11px; padding: .05rem .45rem; border: 1px solid var(--line); color: var(--dim); }
   .badge.ok { color: var(--accent); border-color: #2c5548; }
   .badge.bad { color: var(--bad); border-color: #5a3230; }
+  /* hog/spike are the words Go publishes (internal/perf/rank.go), coloured the
+     way the TUI tints the same badge: red is eat-the-box, amber is a jump. */
+  .flag { font-size: 11px; padding: .05rem .4rem; border: 1px solid var(--line); margin-right: .3rem; color: var(--dim); }
+  .flag.hog { color: var(--bad); border-color: #5a3230; }
+  .flag.spike { color: var(--warn); border-color: #57451f; }
+  .spark { display: block; }
+  .spark-line { fill: none; stroke: var(--accent); stroke-width: 1; }
   .age { margin-left: auto; font-size: 11px; font-weight: 400; color: var(--dim); }
   .age.stale { color: var(--warn); }
   .stats { display: flex; flex-wrap: wrap; gap: .2rem 1.4rem; padding: .7rem .9rem; border-bottom: 1px solid var(--line); font-size: 12px; }
@@ -86,6 +93,34 @@
   .dot { stroke: none; }
   .dot.ok { fill: var(--accent); }
   .dot.bad { fill: var(--bad); }
+  /* Severity colours mirror the TUI's sevCell: red means error, amber warn. */
+  .sev-error { color: var(--bad); }
+  .sev-warn { color: var(--warn); }
+  .sev-other { color: var(--dim); }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: #1b2530; }
+  td.sig, .err-detail td { white-space: normal; word-break: break-word; }
+  .err-detail td { background: #12181e; }
+  .err-detail .where { color: var(--dim); font-size: 12px; }
+  .err-detail .sample { color: var(--fg); }
+  .err-detail .miss { color: var(--dim); }
+  /* Tag colours are the TUI's six palette slots (internal/app/tags.go), hex for
+     the screen. Both color and fill are set: a label is HTML in the table and
+     SVG on the graph ring. An unknown name from a hand-edited tags.json falls
+     back to slate in script, so a label never disappears. */
+  .tag { border: 1px solid var(--line); padding: .05rem .4rem; margin-right: .45rem; }
+  .tag-sky { color: #87afd7; fill: #87afd7; }
+  .tag-green { color: #5faf5f; fill: #5faf5f; }
+  .tag-amber { color: #ffaf00; fill: #ffaf00; }
+  .tag-rose { color: #eb5f5f; fill: #eb5f5f; }
+  .tag-violet { color: #afafef; fill: #afafef; }
+  .tag-slate { color: #626262; fill: #626262; }
+  .docker { color: var(--dim); }
+  .copy {
+    background: none; border: 1px solid var(--line); color: var(--dim);
+    font: inherit; font-size: 11px; padding: .05rem .5rem; margin-left: .6rem; cursor: pointer;
+  }
+  .copy:hover { color: var(--fg); border-color: #3c4a57; }
 </style>
 </head>
 <body>
@@ -96,11 +131,15 @@
 </header>
 <nav id="tabs">
   <button type="button" data-tab="sessions">Sessions</button>
+  <button type="button" data-tab="perf">Performance</button>
   <button type="button" data-tab="network">Network</button>
+  <button type="button" data-tab="errors">Errors</button>
 </nav>
 <main>
   <div id="sessions"></div>
+  <div id="perf" hidden></div>
   <div id="network" hidden></div>
+  <div id="errors" hidden></div>
 </main>
 
 <template id="tpl-session">
@@ -116,6 +155,7 @@
       <thead><tr>
         <th>name</th><th>image</th><th>state</th><th>status</th>
         <th class="num">cpu</th><th class="num">mem %</th><th class="num">mem usage</th>
+        <th>perf</th>
       </tr></thead>
       <tbody data-rows></tbody>
     </table>
@@ -126,6 +166,7 @@
   <tr>
     <td data-name></td><td data-image></td><td data-state></td><td data-status></td>
     <td class="num" data-cpu></td><td class="num" data-mem></td><td class="num" data-usage></td>
+    <td data-perf></td>
   </tr>
 </template>
 
@@ -141,20 +182,89 @@
   </section>
 </template>
 
+<!-- One panel per session, holding the ranking in the payload's own order. -->
+<template id="tpl-perf">
+  <section class="panel">
+    <h2>
+      <span data-name></span>
+      <span class="target" data-target></span>
+      <span class="badge" data-conn></span>
+      <span class="age" data-age></span>
+    </h2>
+    <div class="stats" data-stats></div>
+    <table>
+      <thead><tr>
+        <th class="num">#</th><th>name</th>
+        <th class="num">cpu</th><th class="num">avg</th><th class="num">peak</th>
+        <th>trend</th><th class="num">share</th>
+        <th class="num">mem</th><th class="num">m.peak</th><th class="num">cpu s</th>
+        <th class="num">throt</th><th>flags</th>
+      </tr></thead>
+      <tbody data-rows></tbody>
+    </table>
+  </section>
+</template>
+
+<template id="tpl-perf-row">
+  <tr>
+    <td class="num" data-rank></td><td data-name></td>
+    <td class="num" data-cpu></td><td class="num" data-avg></td><td class="num" data-peak></td>
+    <td data-trend></td><td class="num" data-share></td>
+    <td class="num" data-mem></td><td class="num" data-mpeak></td>
+    <td class="num" data-cpus></td><td class="num" data-throt></td><td data-flags></td>
+  </tr>
+</template>
+
+<template id="tpl-errors">
+  <section class="panel">
+    <h2>
+      <span>errors</span>
+      <span class="badge" data-coverage></span>
+      <span class="age" data-age></span>
+    </h2>
+    <div class="stats" data-stats></div>
+    <table>
+      <thead><tr>
+        <th class="num">count</th><th>sev</th><th>signature</th><th>hosts</th><th>last</th>
+      </tr></thead>
+      <tbody data-rows></tbody>
+    </table>
+  </section>
+</template>
+
+<!-- One group is two rows: the signature, then its collapsed detail. -->
+<template id="tpl-err-group">
+  <tr class="clickable">
+    <td class="num" data-count></td><td data-sev></td><td class="sig" data-sig></td>
+    <td data-hosts></td><td data-last></td>
+  </tr>
+  <tr class="err-detail" data-detail hidden>
+    <td class="sig" colspan="5"><div data-body></div></td>
+  </tr>
+</template>
+
 <script>
 const RATES = [2000, 5000, 10000, 30000, 60000];
 const STALE_AFTER_S = 6;
+// The six palette slots the TUI can write. Anything else on the wire is a
+// hand-edited tags.json, and the label still has to show — in slate.
+const TAG_COLORS = ['sky', 'green', 'amber', 'rose', 'violet', 'slate'];
+
+function tagClass(color) {
+  return 'tag-' + (TAG_COLORS.includes(color) ? color : 'slate');
+}
 
 function loadRate() {
   const v = Number(localStorage.getItem('vpstui.rate'));
   return RATES.includes(v) ? v : 5000;
 }
 
-// #network deep-links the graph, which beats the remembered tab when present.
+// #perf, #network and #errors deep-link their tab, which beats the remembered one.
 function loadTab() {
   const hash = location.hash.slice(1);
-  if (hash === 'network' || hash === 'sessions') return hash;
-  return localStorage.getItem('vpstui.tab') === 'network' ? 'network' : 'sessions';
+  if (hash === 'perf' || hash === 'network' || hash === 'errors' || hash === 'sessions') return hash;
+  const saved = localStorage.getItem('vpstui.tab');
+  return ['perf', 'network', 'errors'].includes(saved) ? saved : 'sessions';
 }
 
 let pollMs = loadRate();
@@ -171,6 +281,13 @@ async function getJSON(url) {
 }
 
 function node(root, key) { return root.querySelector('[data-' + key + ']'); }
+
+function tagChip(tag, color) {
+  const el = document.createElement('span');
+  el.className = 'tag ' + tagClass(color);
+  el.textContent = tag;
+  return el;
+}
 
 function setStat(parent, label, value) {
   const s = document.createElement('span');
@@ -251,11 +368,17 @@ function renderSession(s) {
     setStat(stats, 'host stats', 'not fetched yet');
   }
 
+  // The #perf rows are keyed by the same short container id this table already
+  // shows, so the badge is the ranking's own verdict joined by id — never a
+  // second threshold computed here.
+  const perfById = new Map();
+  for (const r of ((s.perf && s.perf.rows) || [])) perfById.set(r.id, r);
+
   const rows = node(el, 'rows');
   const containers = s.containers || [];
   if (!containers.length) {
     const td = document.createElement('td');
-    td.colSpan = 7;
+    td.colSpan = 8;
     td.className = 'empty';
     td.textContent = 'no containers reported';
     const tr = document.createElement('tr');
@@ -264,7 +387,20 @@ function renderSession(s) {
   }
   for (const c of containers) {
     const tr = document.getElementById('tpl-row').content.cloneNode(true);
-    node(tr, 'name').textContent = c.name || c.id.slice(0, 12);
+    const docker = c.name || c.id.slice(0, 12);
+    const nameTd = node(tr, 'name');
+    // Label first, docker name behind it in the dim colour — the same order and
+    // the same two strings the TUI table cell holds, so the two surfaces never
+    // look like they are naming different containers.
+    if (c.tag) {
+      nameTd.appendChild(tagChip(c.tag, c.tagColor));
+      const dn = document.createElement('span');
+      dn.className = 'docker';
+      dn.textContent = docker;
+      nameTd.appendChild(dn);
+    } else {
+      nameTd.textContent = docker;
+    }
     node(tr, 'image').textContent = c.image;
     const st = node(tr, 'state');
     st.textContent = c.state;
@@ -274,6 +410,13 @@ function renderSession(s) {
     pctCell(node(tr, 'cpu'), c.cpuPct, c.cpu);
     pctCell(node(tr, 'mem'), c.memPct, c.memPerc);
     node(tr, 'usage').textContent = c.memUsage;
+    const ranked = perfById.get(c.id);
+    const perfTd = node(tr, 'perf');
+    if (ranked && (ranked.flags || []).length) {
+      perfTd.appendChild(flagCells(ranked.flags));
+    } else {
+      perfTd.textContent = ranked ? '-' : '';
+    }
     rows.appendChild(tr);
   }
   return el;
@@ -287,6 +430,13 @@ const CHORD = 96;    // minimum arc spacing between two nodes on a ring
 function trunc(name) {
   return name.length > NAME_MAX ? name.slice(0, NAME_MAX - 1) + '…' : name;
 }
+
+// A labelled container reads as its alias on the ring; the docker name moves into
+// the hover title, because a chord diagram has no room for both. The label colour
+// is the tag's, which is why an untagged node keeps the plain dim class.
+function ctrShown(n) { return n.tag || n.name; }
+function ctrFull(n) { return n.tag ? n.tag + ' — ' + n.name : n.name; }
+function ctrCls(n) { return n.tag ? 'ctr-label ' + tagClass(n.tagColor) : 'ctr-label'; }
 
 function svgEl(tag, attrs, cls) {
   const el = document.createElementNS(SVG_NS, tag);
@@ -388,14 +538,14 @@ function buildGraph(g) {
     const n = byId.get(id);
     if (!n || n.kind !== 'container') continue;
     svg.appendChild(svgEl('circle', { cx: p.x, cy: p.y, r: 4 }, n.state === 'running' ? 'dot ok' : 'dot bad'));
-    svg.appendChild(textEl(p.x, p.y + 16, trunc(n.name), n.name, 'ctr-label'));
+    svg.appendChild(textEl(p.x, p.y + 16, trunc(ctrShown(n)), ctrFull(n), ctrCls(n)));
   }
   if (iso.length) {
     svg.appendChild(textEl(pad, stripTop + 10, 'no user-defined network', 'no user-defined network', 'strip-label', 'start'));
     iso.forEach((n, i) => {
       const x = pad + (i % isoCols) * 168, y = stripTop + 34 + Math.floor(i / isoCols) * 26;
       svg.appendChild(svgEl('circle', { cx: x + 4, cy: y, r: 4 }, n.state === 'running' ? 'dot ok' : 'dot bad'));
-      svg.appendChild(textEl(x + 14, y, trunc(n.name), n.name, 'ctr-label', 'start'));
+      svg.appendChild(textEl(x + 14, y, trunc(ctrShown(n)), ctrFull(n), ctrCls(n), 'start'));
     });
   }
 
@@ -510,6 +660,347 @@ async function tickNetwork(list) {
   setStatus('live · ' + plural(pairs.length, 'session') + ' · ' + plural(nets, 'network'), false);
 }
 
+// --- Performance tab: the ranking the terminal computed --------------------
+
+// Nothing here sorts, thresholds or compares against a constant: Go publishes the
+// order, the flags and the denominators, and the page prints them. A hog on the
+// screen is a hog here because both surfaces read the same reduce.
+
+const SPARK_W = 120, SPARK_H = 22;
+// The only badges internal/perf can write. A class name is built from this, so
+// anything unexpected on the wire renders as a plain word, not a selector.
+const PERF_FLAGS = ['hog', 'spike'];
+
+function trimZero(v) {
+  return v.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+// fmtBytes mirrors perf.Bytes, so one reading carries the same text on both
+// surfaces. Absence is '-', never a 0 that would read as a measurement.
+function fmtBytes(n) {
+  if (n === null || n === undefined || n < 0) return '-';
+  const steps = [[1024 * 1024 * 1024 * 1024, 'TiB'], [1024 * 1024 * 1024, 'GiB'], [1024 * 1024, 'MiB'], [1024, 'KiB']];
+  for (const [m, u] of steps) {
+    if (n >= m) return trimZero(n / m) + u;
+  }
+  return n + 'B';
+}
+
+function fmtPct(v) {
+  return v === null || v === undefined ? '-' : v.toFixed(1) + '%';
+}
+
+function fmtCpuSeconds(sec) {
+  if (sec === null || sec === undefined) return '-';
+  if (sec < 90) return trimZero(sec) + 's';
+  if (sec < 5400) return Math.round(sec / 60) + 'm';
+  return (sec / 3600).toFixed(1) + 'h';
+}
+
+function fmtWindow(sec) {
+  if (sec === null || sec === undefined) return '-';
+  return sec < 60 ? Math.round(sec) + 's' : Math.round(sec / 60) + 'm';
+}
+
+// fmtThrottle keeps the terminal's distinction between "never throttled" and "this
+// host exposes no counter": 0 prints 0, nothing prints '-'.
+function fmtThrottle(r) {
+  if (r.throttled === null || r.throttled === undefined) return '-';
+  if (r.throttled === 0) return '0';
+  return r.throttled + '/' + (r.periods === null || r.periods === undefined ? '?' : r.periods);
+}
+
+function flagSpan(f) {
+  const el = document.createElement('span');
+  const name = String(f);
+  el.className = 'flag ' + (PERF_FLAGS.includes(name) ? name : 'other');
+  el.textContent = name.toUpperCase();
+  return el;
+}
+
+function flagCells(flags) {
+  const frag = document.createDocumentFragment();
+  for (const f of flags || []) frag.appendChild(flagSpan(f));
+  return frag;
+}
+
+// sparkline draws the same window the terminal sparkled: oldest point left, scaled
+// to this container's own peak, because "did it spike" is a question about its
+// baseline and not the machine's. The values arrive already downsampled by Go.
+function sparkline(vals, peak) {
+  if (!vals || vals.length < 2) return null;
+  const lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  const top = hi > lo ? hi : lo + 1; // a flat window still needs a line to sit on
+  const svg = svgEl('svg', { width: SPARK_W, height: SPARK_H }, 'spark');
+  const tip = document.createElementNS(SVG_NS, 'title');
+  tip.textContent = 'peak ' + fmtPct(peak);
+  svg.appendChild(tip);
+  const step = (SPARK_W - 2) / (vals.length - 1);
+  const pts = vals.map((v, i) => {
+    const x = 1 + i * step;
+    const y = SPARK_H - 1 - (Math.max(0, v - lo) / (top - lo)) * (SPARK_H - 2);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  svg.appendChild(svgEl('polyline', { points: pts }, 'spark-line'));
+  return svg;
+}
+
+function perfEmpty(el, rows, text) {
+  const td = document.createElement('td');
+  td.colSpan = 12;
+  td.className = 'empty';
+  td.textContent = text;
+  const tr = document.createElement('tr');
+  tr.appendChild(td);
+  rows.appendChild(tr);
+}
+
+function renderPerf(s) {
+  const el = document.getElementById('tpl-perf').content.cloneNode(true);
+  node(el, 'name').textContent = s.name || s.id;
+  node(el, 'target').textContent = s.target;
+  const conn = node(el, 'conn');
+  conn.textContent = s.connected ? 'connected' : 'down';
+  conn.className = 'badge ' + (s.connected ? 'ok' : 'bad');
+  ageRefs.push({ el: node(el, 'age'), iso: s.fetchedAt });
+
+  const stats = node(el, 'stats');
+  const rows = node(el, 'rows');
+  const p = s.perf;
+  if (!p || !(p.rows || []).length) {
+    // Every denominator the numbers would have needed, stated as missing.
+    setStat(stats, 'window', 'no samples yet');
+    perfEmpty(el, rows, 'the TUI has not buffered a stats tick for this host yet');
+    return el;
+  }
+  const h = s.hostStats || {};
+  setStat(stats, 'cpu', h.numCPU ? String(h.numCPU) : '?');
+  setStat(stats, 'ram', h.memTotalMB ? fmtBytes(h.memTotalMB * 1024 * 1024) : '?');
+  setStat(stats, 'window', fmtWindow(p.windowSec));
+  setStat(stats, 'kept', fmtWindow(p.retentionSec));
+  setStat(stats, 'samples', String(p.samples));
+  if (!p.probed) {
+    setStat(stats, 'all-time', 'not probed — press f in the TUI');
+  } else if (!p.supported) {
+    setStat(stats, 'all-time', (s.name || s.id) + ': cgroup peak not available');
+  } else {
+    // errTime is the clock the errors tab uses, so two panels about one host never
+    // date the same instant differently.
+    setStat(stats, 'probed', errTime(p.probedAt));
+  }
+
+  p.rows.forEach((r, i) => {
+    const tr = document.getElementById('tpl-perf-row').content.cloneNode(true);
+    node(tr, 'rank').textContent = String(i + 1);
+    const nameTd = node(tr, 'name');
+    nameTd.textContent = r.name || r.id;
+    nameTd.title = r.id; // the join key, readable on hover, never guessed
+    node(tr, 'cpu').textContent = fmtPct(r.cpu);
+    node(tr, 'avg').textContent = fmtPct(r.cpuAvg);
+    node(tr, 'peak').textContent = fmtPct(r.cpuPeak);
+    const trend = node(tr, 'trend');
+    const spark = sparkline(r.series, r.cpuPeak);
+    if (spark) trend.appendChild(spark); else trend.textContent = '-';
+    node(tr, 'share').textContent = fmtPct(r.share);
+    node(tr, 'mem').textContent = fmtBytes(r.memBytes);
+    const mpeak = node(tr, 'mpeak');
+    mpeak.textContent = fmtBytes(r.allTimeMemPeakBytes);
+    mpeak.title = 'window peak ' + fmtBytes(r.memPeakBytes);
+    const cpus = node(tr, 'cpus');
+    cpus.textContent = fmtCpuSeconds(r.cpuSeconds);
+    // A total is not a cost until it is a rate: 64 minutes over a week is idle
+    // noise, over ten minutes it is a core. Go divides by the container's own
+    // lifetime, so the cell says which and holds the other on hover.
+    if (r.cpuAvgCores !== null && r.cpuAvgCores !== undefined) {
+      // A rate under a hundredth of a core is not "0 cores" — that would read as a
+      // measurement of idle, which is a stronger claim than "<0.01" and can be false.
+      const rate = r.cpuAvgCores < 0.005 ? '<0.01' : trimZero(r.cpuAvgCores);
+      cpus.title = rate + ' cores averaged over its life';
+    }
+    node(tr, 'throt').textContent = fmtThrottle(r);
+    node(tr, 'flags').appendChild(flagCells(r.flags));
+    rows.appendChild(tr);
+  });
+  return el;
+}
+
+async function tickPerf(list) {
+  // The ranking travels inside the session payload, so this is the same one fetch
+  // per host the sessions tab makes — no second endpoint, no second opinion.
+  const details = await Promise.all(
+    list.map(s => getJSON('/api/sessions/' + encodeURIComponent(s.id)).catch(() => null))
+  );
+  const shown = details.filter(Boolean);
+  const payload = JSON.stringify(shown);
+  if (payload !== lastPayload) {
+    lastPayload = payload;
+    ageRefs = [];
+    rebuild(shown.map(renderPerf));
+  } else {
+    renderAges();
+  }
+  const rowsOf = d => (d.perf && d.perf.rows) ? d.perf.rows : [];
+  const ranked = shown.reduce((n, d) => n + rowsOf(d).length, 0);
+  const hogs = shown.reduce((n, d) => n + rowsOf(d).filter(r => (r.flags || []).includes('hog')).length, 0);
+  setStatus('live · ' + plural(shown.length, 'session') + ' · ' + plural(ranked, 'ranked') +
+    ' · ' + plural(hogs, 'hog'), false);
+}
+
+// --- Errors tab: the cross-host signature aggregate ------------------------
+
+// errTime mirrors the TUI's errTime: today gets a clock, anything older a date.
+function errTime(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '—';
+  const d = new Date(t), now = new Date();
+  const p = n => String(n).padStart(2, '0');
+  const clock = p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()) {
+    return clock;
+  }
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + clock.slice(0, 5);
+}
+
+function div(cls, text) {
+  const el = document.createElement('div');
+  el.className = cls;
+  el.textContent = text;
+  return el;
+}
+
+// sampleLine and groupText rebuild, byte for byte, the two strings the TUI's y and
+// Y write to the clipboard: a raw line that greps on the host (docker names, not
+// labels), and a signature header a human reads (labels, because it is for reading).
+// The API publishes one representative sample per group, so the page's group copy
+// carries the header plus that line; the TUI appends every line it retained.
+function sampleLine(s) {
+  if (!s) return '';
+  return s.host + '/' + s.container + ' ' + (s.stamp || '—') + ' ' + s.sev + ' ' + s.text;
+}
+
+function groupText(g) {
+  const head = g.sig + '  (' + g.sev + ', ' + g.count + '×, ' +
+    (g.containers || []).join(' + ') + ', ' + errTime(g.firstSeen) + ' → ' + errTime(g.lastSeen) + ')';
+  // The API publishes the newest lines behind the signature, oldest first, so a
+  // copied group is the same text the TUI's Y writes: header for the human, raw
+  // docker lines for grep on the host.
+  const lines = (g.examples && g.examples.length ? g.examples : [g.sample])
+    .map(sampleLine).filter(Boolean);
+  return lines.length ? head + '\n' + lines.join('\n') : head;
+}
+
+// Text is assembled from JSON fields and handed to the clipboard as a string. It
+// never enters the document, so remote log text cannot become markup.
+function copyButton(text, label, tip) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'copy';
+  b.textContent = label;
+  if (tip) b.title = tip;
+  // The group row toggles its own pane on click, so the button swallows the event.
+  b.addEventListener('click', (ev) => { ev.stopPropagation(); copyText(text); });
+  return b;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus('copied ' + plural(text.split('\n').length, 'line'), false);
+  } catch (err) {
+    setStatus('copy failed — the browser denied clipboard access', true);
+  }
+}
+
+function renderErrors(e) {
+  const el = document.getElementById('tpl-errors').content.cloneNode(true);
+  const hosts = e.hosts || [], groups = e.groups || [];
+
+  const cov = node(el, 'coverage');
+  cov.textContent = e.swept + ' of ' + hosts.length + ' hosts swept';
+  cov.className = 'badge ' + (e.swept ? 'ok' : 'bad');
+  ageRefs.push({ el: node(el, 'age'), iso: e.fetchedAt });
+
+  const stats = node(el, 'stats');
+  setStat(stats, 'lines', String(e.lineCount || 0));
+  setStat(stats, 'signatures', String(groups.length));
+  setStat(stats, 'connected', String(e.connected || 0));
+  if (e.truncated) {
+    setStat(stats, 'note', 'older lines were dropped — widen VPSTUI_ERR_SINCE or VPSTUI_ERR_TAIL');
+  }
+  // Coverage is spelled out per host: an unvisited host contributes nothing,
+  // and silently omitting it would read as a clean machine.
+  for (const h of hosts) {
+    setStat(stats, h.name, h.swept ? plural(h.lineCount, 'line') + ' @ ' + errTime(h.sweptAt) : 'not swept');
+  }
+
+  const rows = node(el, 'rows');
+  if (!groups.length) {
+    const td = document.createElement('td');
+    td.colSpan = 5;
+    td.className = 'empty';
+    td.textContent = e.swept
+      ? 'no errors or warnings in the swept window'
+      : 'nothing swept yet — open vpstui, then press a and r';
+    const tr = document.createElement('tr');
+    tr.appendChild(td);
+    rows.appendChild(tr);
+  }
+  for (const g of groups) {
+    const frag = document.getElementById('tpl-err-group').content.cloneNode(true);
+    const tr = frag.querySelector('tr.clickable');
+    const detail = frag.querySelector('[data-detail]');
+    node(tr, 'count').textContent = String(g.count);
+    const sev = node(tr, 'sev');
+    sev.textContent = g.sev;
+    sev.className = g.sev === 'error' ? 'sev-error' : g.sev === 'warn' ? 'sev-warn' : 'sev-other';
+    const sig = node(tr, 'sig');
+    sig.textContent = g.sig;
+    sig.appendChild(copyButton(groupText(g), 'copy', 'copy this signature and its newest line'));
+    node(tr, 'hosts').textContent = (g.hosts || []).join(', ');
+    node(tr, 'last').textContent = errTime(g.lastSeen);
+    const body = node(detail, 'body');
+    body.appendChild(div('where', 'containers: ' + (g.containers || []).join(', ') +
+      ' · first ' + errTime(g.firstSeen) + ' · last ' + errTime(g.lastSeen)));
+    const s = g.sample;
+    const line = div('sample', s
+      ? '[' + s.host + '] ' + (s.tag ? s.tag + ' ' : '') + s.container +
+        (s.stamp ? ' ' + s.stamp : '') + '  ' + s.text
+      : 'no sample published');
+    body.appendChild(line);
+    // The label reads before the docker name, in plain text — the same shape the
+    // TUI's expand pane prints, where the name stays searchable and colour is
+    // reserved for severity.
+    if (s) {
+      line.appendChild(copyButton(sampleLine(s), 'copy line', 'copy just this log line'));
+    }
+    tr.addEventListener('click', () => { detail.hidden = !detail.hidden; });
+    rows.appendChild(frag);
+  }
+  return el;
+}
+
+// One request per poll: the reduce across sessions happens server-side, so this
+// tab does not fetch per session like the other two.
+async function tickErrors() {
+  let e;
+  try {
+    e = await getJSON('/api/errors');
+  } catch (err) {
+    setStatus('api unreachable — is vpstui running? (' + err.message + ')', true);
+    return;
+  }
+  const payload = JSON.stringify(e);
+  if (payload !== lastPayload) {
+    lastPayload = payload;
+    ageRefs = [];
+    rebuild([renderErrors(e)]);
+  } else {
+    renderAges();
+  }
+  setStatus('live · ' + plural(e.swept, 'host') + ' swept · ' +
+    plural((e.groups || []).length, 'signature'), false);
+}
+
 async function tick() {
   if (busy) return; // never overlap a slow poll with the next one
   busy = true;
@@ -530,7 +1021,10 @@ async function tick() {
       setStatus('live · no connected sessions', false);
       return;
     }
-    if (tab === 'network') await tickNetwork(list); else await tickSessions(list);
+    if (tab === 'perf') await tickPerf(list);
+    else if (tab === 'network') await tickNetwork(list);
+    else if (tab === 'errors') await tickErrors();
+    else await tickSessions(list);
   } finally {
     busy = false;
   }
@@ -545,14 +1039,16 @@ function applyRate(ms) {
 
 function paintTab() {
   document.getElementById('sessions').hidden = tab !== 'sessions';
+  document.getElementById('perf').hidden = tab !== 'perf';
   document.getElementById('network').hidden = tab !== 'network';
+  document.getElementById('errors').hidden = tab !== 'errors';
   for (const b of document.querySelectorAll('#tabs button')) {
     b.className = b.dataset.tab === tab ? 'active' : '';
   }
 }
 
-// The two tabs render different payloads, so switching drops the cached one
-// rather than comparing against the other view.
+// Each tab renders a different payload, so switching drops the cached one
+// rather than comparing against another view's JSON.
 function switchTab(next) {
   tab = next;
   localStorage.setItem('vpstui.tab', next);

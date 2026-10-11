@@ -27,7 +27,7 @@ func TestRemoveSessionAdjustsActive(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := New(nil)
+			m := New(nil, nil)
 			a := &Session{host: host("a"), gen: 1}
 			b := &Session{host: host("b"), gen: 1}
 			c := &Session{host: host("c"), gen: 1}
@@ -57,7 +57,7 @@ func TestRemoveSessionAdjustsActive(t *testing.T) {
 }
 
 func TestSessionSwitchKeysRearmChain(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	a := &Session{host: host("a"), gen: 1}
 	a.dash = NewDashboard(a.host, nil, 80, 24, a.gen)
 	b := &Session{host: host("b"), gen: 1}
@@ -82,7 +82,7 @@ func TestSessionSwitchKeysRearmChain(t *testing.T) {
 }
 
 func TestPromptCancelDropsOrphanSlot(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	h := host("pw")
 	s := &Session{host: h, gen: 7}
 	m.sessions = []*Session{s}
@@ -101,7 +101,7 @@ func TestPromptCancelDropsOrphanSlot(t *testing.T) {
 }
 
 func TestStaleTaggedMsgDropped(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	s := &Session{host: host("a"), gen: 2}
 	s.dash = NewDashboard(s.host, nil, 80, 24, s.gen)
 	m.sessions = []*Session{s}
@@ -121,7 +121,7 @@ func TestStaleTaggedMsgDropped(t *testing.T) {
 }
 
 func TestBackgroundConnectDoesNotArmTicks(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	live := &Session{host: host("live"), gen: 1}
 	live.dash = NewDashboard(live.host, nil, 80, 24, live.gen)
 	m.sessions = []*Session{live}
@@ -319,7 +319,7 @@ func TestRmKeyGating(t *testing.T) {
 }
 
 func TestStaleDiskMsgDropped(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	s := &Session{host: host("a"), gen: 2}
 	s.dash = NewDashboard(s.host, nil, 80, 24, s.gen)
 	m.sessions = []*Session{s}
@@ -398,7 +398,7 @@ func TestShellExitedToast(t *testing.T) {
 }
 
 func TestStaleShellMsgDropped(t *testing.T) {
-	m := New(nil)
+	m := New(nil, nil)
 	s := &Session{host: host("a"), gen: 2}
 	s.dash = mkDash("running")
 	s.dash.gen = 2

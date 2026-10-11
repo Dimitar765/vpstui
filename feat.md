@@ -1,0 +1,3 @@
+- logs filtering
+- devops agent, analyze logs and performance and suggest optimizations
+- we can tag names for readability [ applys in tui and gui]

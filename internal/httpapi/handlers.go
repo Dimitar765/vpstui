@@ -79,3 +79,14 @@ func (h *handler) getNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, toNetworkJSON(snap))
 }
+
+// getErrors serves the fleet-wide error aggregate. It reduces the corpora the
+// TUI already published, so one request costs a read lock and a sort — never an
+// SSH round trip, and never a second opinion about what counted as an error.
+func (h *handler) getErrors(w http.ResponseWriter, _ *http.Request) {
+	if h.store.IsClosed() {
+		h.unavailable(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, toErrorsJSON(h.store.All()))
+}

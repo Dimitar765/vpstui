@@ -1,10 +1,11 @@
 package app
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"vpstui/internal/perf"
 )
 
 var (
@@ -37,10 +38,24 @@ func stateCell(state string) string {
 	}
 }
 
-// pctCell colorizes percentage strings by threshold: ≥90 err, ≥75 warn.
+// sevCell colors an aggregated severity exactly as the log view colors a
+// matching line, so red means the same thing on both screens.
+func sevCell(s string) string {
+	switch s {
+	case "error":
+		return styleErr.Render(s)
+	case "warn":
+		return styleWarn.Render(s)
+	}
+	return s
+}
+
+// pctCell colorizes percentage strings by threshold: ≥90 err, ≥75 warn. The
+// number comes from perf.Percent, the one parser the ranking and the published
+// JSON use, so a cell cannot be red on one surface and unmeasured on another.
 func pctCell(s string) string {
-	f, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(s), "%"), 64)
-	if err != nil {
+	f, ok := perf.Percent(s)
+	if !ok {
 		return s
 	}
 	switch {
@@ -50,6 +65,25 @@ func pctCell(s string) string {
 		return styleWarn.Render(s)
 	}
 	return s
+}
+
+// flagCell colors a perf badge pair. Both flags share one column, so the words
+// are colored individually — red means the container holds the machine, amber
+// that it jumped, and a row carrying both says both.
+func flagCell(s string) string {
+	if s == "" {
+		return s
+	}
+	parts := strings.Split(s, " ")
+	for i, p := range parts {
+		switch p {
+		case strings.ToUpper(perf.FlagHog):
+			parts[i] = styleErr.Render(p)
+		case strings.ToUpper(perf.FlagSpike):
+			parts[i] = styleWarn.Render(p)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func lipglossActiveTab() lipgloss.Style {

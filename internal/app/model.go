@@ -31,6 +31,7 @@ const (
 	viewConnecting
 	viewDashboard
 	viewContainer
+	viewErrors
 )
 
 // internal messages
@@ -89,10 +90,40 @@ type detailLoadedMsg struct {
 	err    error
 }
 
+// errLoadedMsg carries one host's parsed error sweep. Parsing happens in the
+// command goroutine, so a multi-megabyte payload never reaches Update.
+type errLoadedMsg struct {
+	msgTag
+	lines     []ErrLine
+	truncated bool
+	at        time.Time
+	err       error
+}
+
 type diskLoadedMsg struct {
 	msgTag
 	objs []models.DiskObject
 	err  error
+}
+
+// peaksLoadedMsg carries the kernel's all-time cgroup counters from one
+// read-only probe. at is when the probe returned, so the screen can date it.
+type peaksLoadedMsg struct {
+	msgTag
+	rows []models.ContainerPeak
+	at   time.Time
+	err  error
+}
+
+// perfTickMsg paces the stats-only sample for a session whose dashboard is not
+// on screen. The 2 s tick runs only for the active host, so without this every
+// background host's ranking would freeze at whatever it looked like once.
+type perfTickMsg struct{ msgTag }
+
+type perfLoadedMsg struct {
+	msgTag
+	cstats []models.ContainerStats
+	err    error
 }
 
 type shellExitedMsg struct {
@@ -109,8 +140,8 @@ type shellProbeDoneMsg struct {
 }
 
 // Session is one live (or dialing) connection to a host. Only the active
-// session's dashboard ticks; background sessions pause but keep buffering
-// log chunks.
+// session's dashboard ticks at 2 s; background sessions pause that chain but
+// keep buffering log chunks and take the slower perf sample (§ perfTickMsg).
 type Session struct {
 	host models.Host
 	gen  uint64
@@ -118,6 +149,10 @@ type Session struct {
 	dock *docker.Executor
 	dash *Dashboard
 	cv   *ContainerView
+
+	// perfArmed guarantees one 10 s stats-only chain per session generation,
+	// the same once-per-generation guarantee errArmed gives the log sweep.
+	perfArmed bool
 }
 
 type Model struct {
@@ -140,18 +175,30 @@ type Model struct {
 	pendingGen  uint64
 	genSeq      uint64
 
+	// errView is the cross-host aggregate, built on demand. errReturn is the
+	// screen "a" was pressed from, so esc lands where the user came from.
+	errView   *ErrorsView
+	errReturn View
+
+	// tags holds the user's own labels; tag is the prompt that edits them. Both
+	// live at root because a label spans every surface, not one screen.
+	tags *TagStore
+	tag  tagPrompt
+
 	send     func(tea.Msg)
 	quitting bool
 	api      *httpapi.Store
 }
 
-func New(hosts []models.Host) *Model {
+func New(hosts []models.Host, tags map[string]models.Tag) *Model {
 	m := &Model{
 		hosts:  hosts,
 		view:   viewHosts,
 		active: -1,
 		sp:     spinner.New(spinner.WithSpinner(spinner.Dot)),
 		api:    httpapi.NewStore(),
+		tags:   NewTagStore(tags),
+		tag:    newTagPrompt(),
 	}
 	m.list = NewHostList(hosts)
 	return m
@@ -239,6 +286,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.form.SetSize(msg.Width)
 		}
 		contentH := msg.Height - m.tabRows()
+		if m.errView != nil {
+			m.errView.SetSize(msg.Width, contentH)
+		}
 		for _, s := range m.sessions {
 			if s.dash != nil {
 				s.dash.SetSize(msg.Width, contentH)
@@ -259,7 +309,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, shellExitedMsg, shellProbeDoneMsg:
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, errLoadedMsg, shellExitedMsg, shellProbeDoneMsg, peaksLoadedMsg, perfTickMsg, perfLoadedMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -281,6 +331,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case formSubmittedMsg:
 		return m.saveHost(msg)
 
+	case yankMsg:
+		// Reported as counts only — the yanked text came off a remote container
+		// and must not be put back on screen as though it were our own message.
+		if m.errView != nil && m.view == viewErrors {
+			m.errView.SetNote(msg.Describe())
+		} else {
+			m.status = msg.Describe()
+		}
+		return m, nil
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.sp, cmd = m.sp.Update(msg)
@@ -296,6 +356,9 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "q" {
 			m.cleanup()
 			return m, tea.Quit
+		}
+		if msg.String() == "a" {
+			return m.openErrors()
 		}
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
@@ -351,8 +414,21 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case viewDashboard:
+		// The label prompt has the keys while it is open: tab chooses a colour
+		// and digits are ordinary typing, so sessionKeys must not run first.
+		if m.tag.active {
+			return m.updateTag(msg)
+		}
 		if handled, cmd := m.sessionKeys(msg.String()); handled {
 			return m, cmd
+		}
+		switch msg.String() {
+		case "a":
+			return m.openErrors()
+		case "t":
+			return m.openTagPrompt()
+		case "T":
+			return m.untagCursor()
 		}
 		s := m.activeSession()
 		if s == nil || s.dash == nil {
@@ -371,6 +447,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.cv = NewContainerView(req.id, req.name, m.width, m.height-m.tabRows())
 			s.cv.hostID = s.dash.hostID
 			s.cv.gen = s.dash.gen
+			s.cv.SetTag(m.tags.Display(s.host.ID, req.name), m.tags.Tint(s.host.ID, req.name))
 			m.view = viewContainer
 			return m, startLogStream(s, req.id, m.send)
 		}
@@ -407,6 +484,51 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if s != nil && s.cv != nil {
 			s.cv, cmd = s.cv.Update(msg)
 		}
+		return m, cmd
+
+	case viewErrors:
+		if m.errView == nil {
+			m.view = viewHosts
+			return m, nil
+		}
+		key := msg.String()
+		if m.tag.active {
+			return m.updateTag(msg)
+		}
+		if key == "esc" && m.errView.HandleEscape() {
+			return m, nil // closed the expand pane, stay on the screen
+		}
+		if key == "esc" || key == "q" {
+			m.view = m.errReturn
+			return m, nil
+		}
+		if key == "r" {
+			cmd := m.sweepAll()
+			// Re-merge immediately: the sessions now report a sweep in
+			// flight, and a key press that shows nothing looks like a no-op.
+			m.errView.Refresh(m.sessions, len(m.hosts))
+			if cmd == nil {
+				m.errView.SetNote("no connected host to sweep")
+			}
+			return m, cmd
+		}
+		if key == "l" {
+			return m.openLiveLog()
+		}
+		if key == "y" {
+			return m, yankCmd(m.errView.yankLine())
+		}
+		if key == "Y" {
+			return m, yankCmd(m.errView.yankGroup())
+		}
+		if key == "t" {
+			return m.openTagPrompt()
+		}
+		if key == "T" {
+			return m.untagCursor()
+		}
+		var cmd tea.Cmd
+		m.errView, cmd = m.errView.Update(msg)
 		return m, cmd
 	}
 	return m, nil
@@ -490,6 +612,210 @@ func (m *Model) openOrConnect(h models.Host) (tea.Model, tea.Cmd) {
 	return m.startConnect(h)
 }
 
+// openErrors shows the cross-host aggregate. It merges what the sessions have
+// already swept; it never starts a sweep of its own, so opening the screen is
+// free. "r" is the explicit request to go and read more hosts.
+func (m *Model) openErrors() (tea.Model, tea.Cmd) {
+	contentH := m.height - m.tabRows()
+	if m.errView == nil {
+		m.errView = NewErrorsView(m.width, contentH)
+	} else {
+		m.errView.SetSize(m.width, contentH)
+	}
+	m.errView.SetTags(m.tags)
+	m.errView.Refresh(m.sessions, len(m.hosts))
+	m.errReturn = m.view
+	m.view = viewErrors
+	return m, nil
+}
+
+// sweepAll re-reads every connected host. This is the only path that touches a
+// host the user is not looking at, and it exists only as an explicit key press.
+func (m *Model) sweepAll() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, s := range m.sessions {
+		if s.dash == nil || s.conn == nil {
+			continue
+		}
+		s.dash.errArmed = true // the sweep is running; do not arm it again
+		if cmd := s.dash.SweepErrors(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+// openLiveLog jumps from an aggregate row to that container's live stream,
+// switching to the session that owns the host first.
+func (m *Model) openLiveLog() (tea.Model, tea.Cmd) {
+	t, ok := m.errView.LiveTarget()
+	if !ok {
+		return m, nil
+	}
+	s := m.findSessionByHost(t.hostID)
+	if s == nil || s.dock == nil {
+		name := t.hostID
+		for _, h := range m.hosts {
+			if h.ID == t.hostID {
+				name = h.Name
+			}
+		}
+		m.errView.SetNote("connect " + name + " first to follow its logs")
+		return m, nil
+	}
+	m.active = m.indexOf(s)
+	s.cv = NewContainerView(t.id, t.name, m.width, m.height-m.tabRows())
+	s.cv.hostID, s.cv.gen = s.host.ID, s.gen
+	s.cv.SetTag(m.tags.Display(t.hostID, t.name), m.tags.Tint(t.hostID, t.name))
+	m.view = viewContainer
+	return m, startLogStream(s, t.id, m.send)
+}
+
+// tagCursor opens the label prompt for whatever the cursor points at. The Errors
+// screen and the dashboard resolve their own row, so one key means one thing on
+// both.
+func (m *Model) tagCursor() (tagTarget, bool) {
+	if m.view == viewErrors {
+		if m.errView == nil {
+			return tagTarget{}, false
+		}
+		return m.errView.TagTarget()
+	}
+	s := m.activeSession()
+	if s == nil || s.dash == nil {
+		return tagTarget{}, false
+	}
+	return s.dash.TagTarget()
+}
+
+func (m *Model) openTagPrompt() (tea.Model, tea.Cmd) {
+	t, ok := m.tagCursor()
+	if !ok {
+		m.tagFeedback("no container under the cursor", true)
+		return m, nil
+	}
+	cur, _ := m.tags.Get(t.hostID, t.name)
+	cmd := m.tag.open(t, cur.Tag, cur.Color)
+	m.syncTagPrompt()
+	return m, cmd
+}
+
+// untagCursor drops a label without opening the prompt — pressing T on an
+// unlabelled container is a no-op rather than a surprise file write.
+func (m *Model) untagCursor() (tea.Model, tea.Cmd) {
+	t, ok := m.tagCursor()
+	if !ok {
+		m.tagFeedback("no container under the cursor", true)
+		return m, nil
+	}
+	if !m.tags.Clear(t.hostID, t.name) {
+		m.tagFeedback(t.name+" has no tag", false)
+		return m, nil
+	}
+	m.afterTagChange(t.hostID, "tag cleared from "+t.name, false)
+	return m, nil
+}
+
+// updateTag runs the prompt. Every key it consumes is stopped here, so nothing
+// else on the screen can react to typing.
+func (m *Model) updateTag(msg tea.Msg) (tea.Model, tea.Cmd) {
+	outcome, cmd := m.tag.Update(msg)
+	switch outcome {
+	case promptCommit:
+		m.commitTag()
+	default:
+		// The prompt row is a pre-rendered string, so every keystroke that keeps
+		// it open has to refresh it — otherwise the field looks dead while typing.
+		m.syncTagPrompt()
+	}
+	if cmd == nil {
+		return m, nil
+	}
+	return m, cmd
+}
+
+func (m *Model) commitTag() {
+	t := m.tag.target
+	label, ok := m.tag.value()
+	if !ok {
+		// Emptied (or nothing but separators): the prefilled label was deleted on
+		// purpose, so this is an untag.
+		if m.tags.Clear(t.hostID, t.name) {
+			m.afterTagChange(t.hostID, "tag cleared from "+t.name, false)
+			return
+		}
+		m.tagFeedback("tag needs some text", true)
+		return
+	}
+	if m.tags.Set(t.hostID, t.name, label, m.tag.color, t.id) {
+		m.afterTagChange(t.hostID, "tagged "+t.name+" as "+label, false)
+		return
+	}
+	m.syncTagPrompt()
+}
+
+// afterTagChange persists the label and repaints every surface that shows it.
+// The save is the only part that can fail, and its error goes to the same place
+// as the success message.
+func (m *Model) afterTagChange(hostID, msg string, isErr bool) {
+	if err := config.SaveTags(m.tags.All()); err != nil {
+		msg, isErr = "could not save tags: "+err.Error(), true
+	}
+	m.repaintTag(hostID)
+	// Last, because refreshing the Errors screen clears a note set before it.
+	m.tagFeedback(msg, isErr)
+	m.syncTagPrompt()
+}
+
+// repaintTag redraws every surface that reads labels, for the host whose label
+// just changed.
+func (m *Model) repaintTag(hostID string) {
+	for _, s := range m.sessions {
+		if s.host.ID != hostID {
+			continue
+		}
+		if s.dash != nil {
+			s.dash.rebuild()
+		}
+		if s.cv != nil {
+			s.cv.SetTag(m.tags.Display(hostID, s.cv.name), m.tags.Tint(hostID, s.cv.name))
+		}
+		m.publish(s)
+	}
+	if m.view == viewErrors && m.errView != nil {
+		m.errView.Refresh(m.sessions, len(m.hosts))
+	}
+}
+
+// tagFeedback puts a one-shot message where the user is looking.
+func (m *Model) tagFeedback(msg string, isErr bool) {
+	switch {
+	case m.view == viewErrors && m.errView != nil:
+		m.errView.SetNote(msg)
+	case m.view == viewDashboard:
+		if s := m.activeSession(); s != nil && s.dash != nil {
+			s.dash.SetToast(msg, isErr)
+		}
+	default:
+		m.status = msg
+	}
+}
+
+// syncTagPrompt mirrors the live prompt text into the surface that owns the row,
+// and clears it once the prompt closes.
+func (m *Model) syncTagPrompt() {
+	line := m.tag.line(m.width)
+	if s := m.activeSession(); s != nil && s.dash != nil {
+		s.dash.SetPrompt(line)
+	}
+	if m.errView != nil {
+		m.errView.SetPrompt(line)
+	}
+}
+
 func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var t msgTag
 	switch msg := msg.(type) {
@@ -507,7 +833,15 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case detailLoadedMsg:
 		t = msg.msgTag
+	case errLoadedMsg:
+		t = msg.msgTag
 	case diskLoadedMsg:
+		t = msg.msgTag
+	case peaksLoadedMsg:
+		t = msg.msgTag
+	case perfTickMsg:
+		t = msg.msgTag
+	case perfLoadedMsg:
 		t = msg.msgTag
 	case shellExitedMsg:
 		t = msg.msgTag
@@ -526,6 +860,52 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil // chain stops while not viewing
 	case statsLoadedMsg:
+		if s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
+			m.publish(s)
+			// One sweep and one cgroup probe per generation, both started by the
+			// first container list that succeeded — never by the 2 s tick beside it.
+			var cmds []tea.Cmd
+			if msg.listOK {
+				if !s.dash.errArmed {
+					s.dash.errArmed = true
+					if c := s.dash.SweepErrors(); c != nil {
+						cmds = append(cmds, c)
+					}
+				}
+				if !s.dash.peakArmed {
+					s.dash.peakArmed = true
+					if c := s.dash.fetchPeaks(); c != nil {
+						cmds = append(cmds, c)
+					}
+				}
+			}
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
+			}
+		}
+		return m, nil
+	case errLoadedMsg:
+		if s.dash != nil {
+			s.dash, _ = s.dash.Update(msg)
+			m.publish(s)
+			if m.view == viewErrors && m.errView != nil {
+				m.errView.Refresh(m.sessions, len(m.hosts))
+			}
+		}
+		return m, nil
+	case perfTickMsg:
+		if s.dash == nil {
+			return m, nil
+		}
+		// The host on screen is already sampled every 2 s by its own tick; the
+		// chain still runs so that switching away resumes it instead of leaving a
+		// frozen ranking behind.
+		if m.view == viewDashboard && m.activeSession() == s {
+			return m, tickPerf(t.hostID, t.gen)
+		}
+		return m, tea.Batch(s.dash.fetchPerf(), tickPerf(t.hostID, t.gen))
+	case perfLoadedMsg, peaksLoadedMsg:
 		if s.dash != nil {
 			s.dash, _ = s.dash.Update(msg)
 			m.publish(s)
@@ -663,6 +1043,15 @@ func (m *Model) View() string {
 			return m.tabBar() + "\n" + s.cv.View()
 		}
 		return m.tabBar()
+	case viewErrors:
+		if m.errView == nil {
+			return m.tabBar()
+		}
+		body := m.errView.View()
+		if bar := m.tabBar(); bar != "" {
+			body = bar + "\n" + body
+		}
+		return body
 	}
 	return ""
 }
@@ -860,14 +1249,25 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 	s.conn = msg.conn
 	s.dock = docker.New(msg.conn)
 	s.dash = NewDashboard(msg.host, s.dock, m.width, m.height-m.tabRows(), msg.gen)
+	s.dash.SetTags(m.tags)
 	m.refreshConnected()
 	m.publish(s)
 	if m.view == viewConnecting && m.pendingGen == msg.gen {
 		m.view = viewDashboard
 		m.active = m.indexOf(s)
 	}
+	var cmds []tea.Cmd
 	if m.view == viewDashboard && m.active == m.indexOf(s) {
-		return m, tea.Batch(s.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
+		cmds = append(cmds, s.dash.fetchNow(), tickStats(msg.host.ID, msg.gen))
+	}
+	// One perf chain per generation, for every connected host including the one
+	// on screen: the tick itself decides whether a fetch is needed.
+	if !s.perfArmed {
+		s.perfArmed = true
+		cmds = append(cmds, tickPerf(msg.host.ID, msg.gen))
+	}
+	if len(cmds) > 0 {
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }
@@ -889,6 +1289,15 @@ func startLogStream(s *Session, id string, send func(tea.Msg)) tea.Cmd {
 func tickStats(hostID string, gen uint64) tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
 		return statsTickMsg{msgTag: msgTag{hostID: hostID, gen: gen}}
+	})
+}
+
+// tickPerf paces the stats-only sample for a session whose dashboard is not on
+// screen. Unlike the 2 s chain it never stops when the host loses focus, because
+// a frozen ranking and an empty sparkline are exactly what this exists to avoid.
+func tickPerf(hostID string, gen uint64) tea.Cmd {
+	return tea.Tick(perfEvery, func(time.Time) tea.Msg {
+		return perfTickMsg{msgTag: msgTag{hostID: hostID, gen: gen}}
 	})
 }
 

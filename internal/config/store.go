@@ -53,11 +53,18 @@ func Save(hosts []models.Host) error {
 	if err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(hosts, "", "  ")
+	return writeJSON(p, hosts)
+}
+
+// writeJSON replaces a file atomically at 0600. Every vpstui config document
+// goes through here: a crash mid-write must never leave a half-written hosts or
+// tags file that the next start would refuse to load.
+func writeJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := p + ".tmp"
+	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
@@ -71,5 +78,5 @@ func Save(hosts []models.Host) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, p)
+	return os.Rename(tmp, path)
 }

@@ -164,3 +164,145 @@ func TestToNetworkJSONTruncates(t *testing.T) {
 		t.Fatalf("edges = %d, want %d", len(got.Edges), maxGraphNodes-1)
 	}
 }
+
+func i64(v int64) *int64     { return &v }
+func f64(v float64) *float64 { return &v }
+
+// perfFixture is one session after a probe: the hog carries the kernel's
+// all-time counters, the idling container was never probed.
+func perfFixture() SessionSnapshot {
+	return SessionSnapshot{
+		ID: "h1", Name: "web", FetchedAt: time.Unix(5000, 0),
+		Perf: &PerfSection{
+			Window:    20 * time.Minute,
+			Retention: 30 * time.Minute,
+			Samples:   620,
+			ProbedAt:  time.Unix(4900, 0).UTC(),
+			Supported: true,
+			Rows: []PerfSnapshot{
+				{
+					ID: "bbb222222222", Name: "hog", CPU: 42, CPUAvg: 3.8, CPUPeak: 61.2,
+					// 42% of one core on a 12-core box is 3.5% of the box: share is a
+					// percentage, printed exactly as the terminal prints it.
+					Share: 3.5, Spike: 11.1, Flags: []string{"hog", "spike"}, Samples: 310,
+					MemBytes: 1298234, MemPeakBytes: 1503234,
+					AllTimeMemPeakBytes: i64(1503234), CPUSeconds: f64(961.9),
+					// 961.9 CPU-seconds over the container's own life, divided in Go:
+					// the page never computes a rate of its own.
+					CPUAvgCores: f64(0.26),
+					Throttled:   i64(0), Periods: i64(0),
+					Series: []float64{0.1, 42},
+				},
+				{
+					ID: "aaa111111111", Name: "idle", CPU: 1, CPUAvg: 1, CPUPeak: 1,
+					Samples: 310, Series: []float64{1},
+				},
+			},
+		},
+	}
+}
+
+func TestToPerfJSONAbsentWithoutRows(t *testing.T) {
+	cases := map[string]*PerfSection{
+		"nil":      nil,
+		"no rows":  {Window: 20 * time.Minute},
+		"empty id": {Rows: []PerfSnapshot{}},
+	}
+	for name, p := range cases {
+		if got := toPerfJSON(p); got != nil {
+			t.Errorf("%s: perf emitted for a window with nothing in it: %+v", name, got)
+		}
+		if got := toSessionJSON(SessionSnapshot{ID: "h", Perf: p}); got.Perf != nil {
+			t.Errorf("%s: session carries a perf object: %+v", name, got.Perf)
+		}
+	}
+	body, err := json.Marshal(toSessionJSON(SessionSnapshot{ID: "h"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(body, []byte(`"perf"`)) {
+		t.Errorf("unprobed session serialises a perf key: %s", body)
+	}
+}
+
+func TestToPerfJSONMapsWindow(t *testing.T) {
+	got := toPerfJSON(perfFixture().Perf)
+	if got == nil {
+		t.Fatal("perf nil with rows present")
+	}
+	if got.WindowSec != 1200 || got.RetentionSec != 1800 || got.Samples != 620 {
+		t.Errorf("window/retention/samples = %v/%v/%v, want 1200/1800/620",
+			got.WindowSec, got.RetentionSec, got.Samples)
+	}
+	if !got.Probed || !got.ProbedAt.Equal(time.Unix(4900, 0).UTC()) || !got.Supported {
+		t.Errorf("probe metadata = probed %v at %v supported %v", got.Probed, got.ProbedAt, got.Supported)
+	}
+	// The rank order the terminal computed, untouched.
+	if len(got.Rows) != 2 || got.Rows[0].ID != "bbb222222222" || got.Rows[1].ID != "aaa111111111" {
+		t.Fatalf("rows reordered: %+v", got.Rows)
+	}
+	if !reflect.DeepEqual(got.Rows[0].Flags, []string{"hog", "spike"}) {
+		t.Errorf("flags = %v, want hog spike", got.Rows[0].Flags)
+	}
+	if got.Rows[0].AllTimeMemPeakBytes == nil || *got.Rows[0].AllTimeMemPeakBytes != 1503234 {
+		t.Errorf("all-time peak dropped: %+v", got.Rows[0])
+	}
+	if got.Rows[0].CPUAvgCores == nil || *got.Rows[0].CPUAvgCores != 0.26 {
+		t.Errorf("the cumulative-seconds rate was dropped: %+v", got.Rows[0])
+	}
+	if got.Rows[1].AllTimeMemPeakBytes != nil || got.Rows[1].CPUSeconds != nil ||
+		got.Rows[1].CPUAvgCores != nil ||
+		got.Rows[1].Throttled != nil || got.Rows[1].Periods != nil {
+		t.Errorf("unprobed container claims counters: %+v", got.Rows[1])
+	}
+}
+
+func TestToPerfJSONNoNullArrays(t *testing.T) {
+	sec := perfFixture().Perf
+	// A container read but never sampled: both lists arrive nil from the buffer.
+	sec.Rows = append(sec.Rows, PerfSnapshot{ID: "ccc333333333", Name: "fresh"})
+	got := toPerfJSON(sec)
+	if got.Rows[1].Flags == nil || got.Rows[2].Flags == nil || got.Rows[2].Series == nil {
+		t.Errorf("nil lists kept nil, so they would serialise as null: %+v", got.Rows)
+	}
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A page iterates flags and series unconditionally, so neither may be null.
+	for _, want := range []string{`"flags":[]`, `"series":[1]`, `"series":[]`} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("payload missing %s: %s", want, body)
+		}
+	}
+	if bytes.Contains(body, []byte("null")) {
+		t.Errorf("payload contains a null: %s", body)
+	}
+}
+
+func TestToPerfJSONDeterministic(t *testing.T) {
+	snap := perfFixture()
+	first, err := json.Marshal(toSessionJSON(snap))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 20 {
+		again, err := json.Marshal(toSessionJSON(snap))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(first, again) {
+			t.Fatalf("payload changed between identical snapshots:\n%s\n%s", first, again)
+		}
+	}
+	// A zero flag list and a nil one must not be two different payloads.
+	withEmpty := perfFixture()
+	withEmpty.Perf.Rows[1].Flags = []string{}
+	b, err := json.Marshal(toSessionJSON(withEmpty))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, b) {
+		t.Errorf("empty flags changed the payload:\n%s\n%s", first, b)
+	}
+}

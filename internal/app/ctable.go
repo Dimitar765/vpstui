@@ -14,6 +14,13 @@ const (
 	cellPlain cellKind = iota
 	cellState
 	cellPct
+	cellSev
+	// cellTag is the container name cell: the text already carries the user's
+	// label and the docker name, and the row's tag colour goes on after fitting.
+	cellTag
+	// cellFlag is the perf badge cell, which colours each word of the pair on its
+	// own — a column kind cannot do that for one shared cell.
+	cellFlag
 )
 
 type ctableCol struct {
@@ -29,7 +36,8 @@ type ctableCol struct {
 type ctable struct {
 	cols   []ctableCol
 	rows   [][]string
-	header []bool // group header rows (compose)
+	header []bool   // group header rows (compose)
+	tint   []string // per-row tag colour name, "" when untagged; parallel to rows
 	cursor int
 	offset int
 	width  int
@@ -37,6 +45,10 @@ type ctable struct {
 }
 
 func (t *ctable) SetColumns(cols []ctableCol) { t.cols = cols }
+
+// SetTint gives the rows their tag colours. It is set alongside SetRows by the
+// views that use cellTag, and may be nil.
+func (t *ctable) SetTint(tint []string) { t.tint = tint }
 
 func (t *ctable) SetSize(w, h int) {
 	t.width = max(w, 10)
@@ -126,7 +138,10 @@ func (t ctable) View() string {
 	}
 	parts := make([]string, len(t.cols))
 	for i, c := range t.cols {
-		parts[i] = fitPlain(c.title, c.width)
+		// Padded exactly as renderRow pads a cell, or the labels would sit
+		// left-packed above columns that start much further right.
+		parts[i] = lipgloss.NewStyle().Width(c.width).MaxWidth(c.width).Inline(true).
+			Render(fitPlain(c.title, c.width))
 	}
 	var b strings.Builder
 	b.WriteString(styleTableHeader.Render(strings.Join(parts, strings.Repeat(" ", cellGap))) + "\n")
@@ -152,6 +167,12 @@ func (t ctable) renderRow(i int) string {
 			v = stateCell(v)
 		case cellPct:
 			v = pctCell(v)
+		case cellSev:
+			v = sevCell(v)
+		case cellTag:
+			v = t.rowTint(i).Render(fitPlain(v, c.width))
+		case cellFlag:
+			v = flagCell(fitPlain(v, c.width))
 		default:
 			v = fitPlain(v, c.width)
 		}
@@ -162,6 +183,15 @@ func (t ctable) renderRow(i int) string {
 		line = styleComposeHeader.Render(line)
 	}
 	return line
+}
+
+// rowTint is the colour a tagged row asks for; an untagged or out-of-range row
+// renders in the terminal's default foreground.
+func (t ctable) rowTint(i int) lipgloss.Style {
+	if i < 0 || i >= len(t.tint) || t.tint[i] == "" {
+		return lipgloss.NewStyle()
+	}
+	return tagStyle(t.tint[i])
 }
 
 func fitPlain(s string, w int) string {

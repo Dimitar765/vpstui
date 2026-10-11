@@ -8,9 +8,11 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"vpstui/internal/docker"
 	"vpstui/internal/models"
+	"vpstui/internal/perf"
 )
 
 type containerReq struct {
@@ -35,8 +37,41 @@ type Dashboard struct {
 	tbl          ctable
 	containers   []models.Container
 	stats        map[string]models.ContainerStats // by container name
+	tags         *TagStore                        // shared with root; nil-safe
 	hstats       models.HostStats
 	hasHostStats bool
+
+	// perf is this session's CPU and memory history. It records every stats tick,
+	// screen open or not: a peak that only exists while the user is looking is not
+	// a peak.
+	perf *perf.Buffer
+
+	// The ranking screen. perfRanks is exactly what the table shows, and the
+	// cursor is anchored by container id rather than row index, because a live
+	// ranking re-orders rows every 2 s and an index cursor would teleport.
+	showPerf     bool
+	perfTbl      ctable
+	perfRanks    []perf.Rank
+	perfCursorID string
+
+	// perfBusy marks the 10 s background sample as in flight, so a host that
+	// answers slowly cannot stack round trips behind its own tick.
+	perfBusy bool
+
+	// perfNames remembers the name each sampled id reported. A background
+	// session's container list is frozen until it is opened, so without this a
+	// container started after the connection would be sampled but never ranked.
+	perfNames map[string]string
+
+	// peaks holds the kernel's all-time counters, keyed by short container id.
+	// peakArmed makes the probe once-per-generation exactly like errArmed: it is
+	// one extra read-only command, so it runs when the container list first
+	// succeeds and when the user asks with f — never beside the stats tick.
+	peaks         map[string]models.ContainerPeak
+	peakArmed     bool
+	peakLoading   bool
+	peakProblem   string
+	peakFetchedAt time.Time
 
 	collapsed map[string]bool // compose project → folded
 	rowCIdx   []int           // table row → containers index, -1 for group headers
@@ -56,6 +91,20 @@ type Dashboard struct {
 	disconnected bool
 	reconnect    bool
 
+	// Error sweep state. errArmed makes the sweep once-per-generation: root
+	// arms it after the first successful container list and after reconnect,
+	// and "f" re-arms it. The 2 s stats tick never does.
+	errCorpus    []ErrLine
+	errFetchedAt time.Time
+	errTruncated bool
+	errLoading   bool
+	errProblem   string
+	errArmed     bool
+
+	// prompt is the pre-rendered tag prompt line, owned by root and shown in
+	// the same slot a toast uses so it cannot add a row to the frame.
+	prompt string
+
 	width, height int
 	back          bool
 	logReq        *containerReq
@@ -64,7 +113,7 @@ type Dashboard struct {
 }
 
 var dashCols = []ctableCol{
-	{title: "Name", width: 16, kind: cellPlain},
+	{title: "Name", width: 16, kind: cellTag},
 	{title: "Image", width: 18, kind: cellPlain},
 	{title: "State", width: 12, kind: cellState},
 	{title: "Status", width: 18, kind: cellPlain},
@@ -124,20 +173,58 @@ func colsFor(total int) []ctableCol {
 }
 
 func NewDashboard(host models.Host, dock *docker.Executor, w, h int, gen uint64) *Dashboard {
-	d := &Dashboard{host: host, dock: dock, hostID: host.ID, gen: gen, stats: map[string]models.ContainerStats{}, collapsed: map[string]bool{}, width: w, height: h}
+	d := &Dashboard{
+		host: host, dock: dock, hostID: host.ID, gen: gen,
+		stats: map[string]models.ContainerStats{}, collapsed: map[string]bool{},
+		perf:      perf.New(perf.Cap, perf.Horizon),
+		peaks:     map[string]models.ContainerPeak{},
+		perfNames: map[string]string{},
+		width:     w, height: h,
+	}
 	d.tbl.SetColumns(colsFor(max(w-2, 20)))
 	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
+	d.perfTbl.SetColumns(perfColsFor(max(w-2, 20)))
+	d.perfTbl.SetSize(max(w-2, 20), max(h-10, 3))
 	return d
 }
 
-func (d *Dashboard) tag(hostID string, gen uint64) bool {
-	return d.hostID == hostID && d.gen == gen
+// SetTags hands the dashboard the shared label store. Root owns the store and
+// every view reads it by pointer, so a tag shows up everywhere at once without
+// any copying or locking.
+func (d *Dashboard) SetTags(t *TagStore) { d.tags = t }
+
+// SetPrompt shows or clears the pre-rendered tag prompt line.
+func (d *Dashboard) SetPrompt(line string) { d.prompt = line }
+
+// SetToast lets root report a result of its own — a label that was saved, or
+// a file that could not be written — through the same one-shot row the docker
+// actions use.
+func (d *Dashboard) SetToast(msg string, isErr bool) { d.toast, d.toastIsErr = msg, isErr }
+
+// TagTarget is the container under the cursor, for the label prompt. A compose
+// header row is not a container, so it reports false there. On the ranking screen
+// it resolves the ranking's own cursor, so one key means the row the user is on.
+func (d *Dashboard) TagTarget() (tagTarget, bool) {
+	if d.showPerf {
+		c, ok := d.perfTarget()
+		if !ok {
+			return tagTarget{}, false
+		}
+		return tagTarget{hostID: d.host.ID, name: c.ShortName(), id: c.ID}, true
+	}
+	c, ok := d.selected()
+	if !ok {
+		return tagTarget{}, false
+	}
+	return tagTarget{hostID: d.host.ID, name: c.ShortName(), id: c.ID}, true
 }
 
 func (d *Dashboard) SetSize(w, h int) {
 	d.width, d.height = w, h
 	d.tbl.SetColumns(colsFor(max(w-2, 20)))
 	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
+	d.perfTbl.SetColumns(perfColsFor(max(w-2, 20)))
+	d.perfTbl.SetSize(max(w-2, 20), max(h-11, 3))
 }
 
 func (d *Dashboard) TakeBack() bool {
@@ -208,6 +295,30 @@ func (d *Dashboard) fetchNow() tea.Cmd {
 	}
 }
 
+// SweepErrors greps every container's recent logs on this host for problems.
+// Root arms it once per session generation, never from the stats tick: fetchNow
+// runs every 2 s, and hanging a log sweep on that would poll harder than the
+// design allows. Parsing happens in the goroutine because a multi-megabyte
+// payload must never touch the UI thread.
+func (d *Dashboard) SweepErrors() tea.Cmd {
+	if d.dock == nil || d.errLoading {
+		return nil
+	}
+	d.errLoading = true
+	d.errProblem = ""
+	dock := d.dock
+	t := msgTag{hostID: d.hostID, gen: d.gen}
+	hostID, hostName := d.hostID, d.host.Name
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		at := time.Now()
+		payload, err := dock.SweepErrors(ctx, errWindow(), errTail())
+		lines, trunc := parseErrSweep(payload, hostID, hostName, at)
+		return errLoadedMsg{msgTag: t, lines: lines, truncated: trunc, at: at, err: err}
+	}
+}
+
 func (d *Dashboard) fetchDisk() tea.Cmd {
 	dock := d.dock
 	t := msgTag{hostID: d.hostID, gen: d.gen}
@@ -257,6 +368,10 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		}
 		d.disconnected = false
 		d.rebuild()
+		// The history records every tick, screen open or not: this is the 2 s path
+		// the plan samples on, and it costs no extra SSH.
+		d.recordPerf(time.Now(), msg.cstats)
+		d.rebuildPerf()
 		return d, nil
 
 	case actionDoneMsg:
@@ -291,6 +406,19 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		d.detail.loading = false
 		return d, nil
 
+	case errLoadedMsg:
+		d.errLoading = false
+		d.errFetchedAt = msg.at
+		d.errTruncated = msg.truncated
+		d.errProblem = ""
+		if msg.err != nil {
+			// Keep whatever lines arrived: one unreadable container should not
+			// hide the rest of the host.
+			d.errProblem = msg.err.Error()
+		}
+		d.errCorpus = capCorpus(msg.lines, errCorpusCap)
+		return d, nil
+
 	case diskLoadedMsg:
 		d.diskLoading = false
 		if msg.err != nil {
@@ -299,6 +427,37 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			d.disk = msg.objs
 			d.diskErr = ""
 		}
+		return d, nil
+
+	case perfTickMsg:
+		return d, nil // root runs the fetch; the dashboard only records
+
+	case perfLoadedMsg:
+		d.perfBusy = false
+		if msg.err != nil {
+			// A failed background sample is not a reportable error: the screen a
+			// user is reading keeps its own status line, and this host is not it.
+			return d, nil
+		}
+		d.recordPerf(time.Now(), msg.cstats)
+		d.rebuildPerf()
+		return d, nil
+
+	case peaksLoadedMsg:
+		d.peakLoading = false
+		if msg.err != nil {
+			// Keep whatever rows a previous probe found: one failed command must not
+			// erase the counters the user is reading.
+			d.peakProblem = msg.err.Error()
+			d.rebuildPerf()
+			return d, nil
+		}
+		d.peaks = make(map[string]models.ContainerPeak, len(msg.rows))
+		for _, p := range msg.rows {
+			d.peaks[p.ID] = p
+		}
+		d.peakFetchedAt = msg.at
+		d.rebuildPerf()
 		return d, nil
 
 	case shellExitedMsg:
@@ -372,6 +531,19 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 				d.confirm = ""
 			}
 		}
+		// Whichever sub-mode is open owns the keys after a confirmation has been
+		// settled, and only one of them is ever open.
+		if d.showPerf {
+			if handled, cmd := d.perfKeys(msg.String()); handled {
+				return d, cmd
+			}
+			var cmd tea.Cmd
+			d.perfTbl, cmd = d.perfTbl.Update(msg)
+			// Navigation moves the anchor, so the next re-rank keeps the cursor on
+			// the container the user chose rather than on the row number.
+			d.takePerfCursor()
+			return d, cmd
+		}
 		if d.showDisk {
 			switch msg.String() {
 			case "esc":
@@ -401,6 +573,10 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			d.back = true
 			return d, nil
 		case "f":
+			// Refresh re-arms the sweep and the cgroup probe too, so "f" is the
+			// user's explicit re-read of this host's logs and kernel counters.
+			d.errArmed = false
+			d.peakArmed = false
 			return d, d.fetchNow()
 		case "enter":
 			if c, ok := d.selected(); ok {
@@ -423,10 +599,15 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			}
 			return d, nil
 		case "i":
+			d.showPerf = false
 			d.showDisk = true
 			d.diskLoading = true
 			d.diskErr = ""
 			return d, d.fetchDisk()
+		case "p":
+			// The ranking screen. Its all-time columns come from the same probe the
+			// first container list armed, so opening it usually shows numbers at once.
+			return d, d.openPerf()
 		case "D":
 			if c, ok := d.selected(); ok {
 				if c.State == "exited" || c.State == "dead" || c.State == "created" {
@@ -504,6 +685,7 @@ func (d *Dashboard) rebuild() {
 
 	rows := make([][]string, 0, len(d.containers))
 	hdrRows := make([]bool, 0, len(d.containers))
+	tint := make([]string, 0, len(d.containers))
 	d.rowCIdx = d.rowCIdx[:0]
 	d.rowProj = d.rowProj[:0]
 	blank := func() []string { return []string{"", "", "", "", "", "", ""} }
@@ -514,6 +696,7 @@ func (d *Dashboard) rebuild() {
 			for _, i := range idxs {
 				rows = append(rows, d.containerRow(d.containers[i]))
 				hdrRows = append(hdrRows, false)
+				tint = append(tint, d.tagColorOf(d.containers[i]))
 				d.rowCIdx = append(d.rowCIdx, i)
 				d.rowProj = append(d.rowProj, "")
 			}
@@ -528,6 +711,7 @@ func (d *Dashboard) rebuild() {
 		hdr[0] = fmt.Sprintf("%s compose:%s (%d)", marker, p, len(idxs))
 		rows = append(rows, hdr)
 		hdrRows = append(hdrRows, true)
+		tint = append(tint, "")
 		d.rowCIdx = append(d.rowCIdx, -1)
 		d.rowProj = append(d.rowProj, p)
 		if folded {
@@ -536,12 +720,14 @@ func (d *Dashboard) rebuild() {
 		for _, i := range idxs {
 			rows = append(rows, d.containerRow(d.containers[i]))
 			hdrRows = append(hdrRows, false)
+			tint = append(tint, d.tagColorOf(d.containers[i]))
 			d.rowCIdx = append(d.rowCIdx, i)
 			d.rowProj = append(d.rowProj, p)
 		}
 	}
 
 	d.tbl.SetRows(rows, hdrRows)
+	d.tbl.SetTint(tint)
 	if cur >= len(rows) {
 		cur = len(rows) - 1
 	}
@@ -558,7 +744,18 @@ func (d *Dashboard) containerRow(c models.Container) []string {
 	if s, ok := d.stats[c.ShortName()]; ok {
 		cpu, mem, memUsage = s.CPUPerc, s.MemPerc, s.MemUsage
 	}
-	return []string{c.ShortName(), c.Image, c.State, c.Status, cpu, mem, memUsage}
+	// The label goes first so a narrow terminal clips the docker name's tail,
+	// never the word the user chose.
+	return []string{d.tags.Display(d.host.ID, c.ShortName()), c.Image, c.State, c.Status, cpu, mem, memUsage}
+}
+
+// tagColorOf is the row's tint for ctable: the palette name, or "" for plain.
+func (d *Dashboard) tagColorOf(c models.Container) string {
+	tag, ok := d.tags.Get(d.host.ID, c.ShortName())
+	if !ok {
+		return ""
+	}
+	return tag.Color
 }
 
 func (d *Dashboard) toggleFold() {
@@ -624,6 +821,9 @@ func (d *Dashboard) View() string {
 			}
 		}
 		b.WriteString(styleWarn.Render(label+"? [y/N]") + "\n")
+	} else if d.prompt != "" {
+		// The tag prompt takes the toast's slot: one row, whichever it shows.
+		b.WriteString(d.prompt + "\n")
 	} else if d.toast != "" {
 		if d.toastIsErr {
 			b.WriteString(styleErr.Render(d.toast) + "\n")
@@ -645,8 +845,29 @@ func (d *Dashboard) View() string {
 		} else {
 			inner.WriteString(d.detail.text)
 		}
+		// The table cell can clip a long name, so the detail pane states both the
+		// label and the docker name in full.
+		if tag, ok := d.tags.Get(d.host.ID, d.detail.name); ok {
+			inner.WriteString(tagStyle(tag.Color).Render("tag        "+tag.Tag) +
+				styleMuted.Render("  (docker name: "+tag.Name+")") + "\n")
+		}
 		b.WriteString(panel(styleTitle.Render("detail — "+d.detail.name), inner.String(), d.width) + "\n")
 		return pinFooter(b.String(), helpLine("esc", "close", "d", "close", "f", "refresh"), d.width, d.height)
+	}
+	if d.showPerf {
+		footer := helpLine("j/k g/G", "nav", "enter", "logs", "t", "tag", "T", "untag", "i", "disk", "f", "re-probe", "esc", "close")
+		status := d.perfStatus() + "\n"
+		head := b.String() + status
+		// The frame is exact: the table gets whatever the header and the footer
+		// leave, so pinFooter never has to overflow the terminal.
+		d.perfTbl.SetSize(max(d.width-2, 20),
+			max(d.height-lipgloss.Height(head)-lipgloss.Height(footer)-1, 1))
+		b.WriteString(status)
+		if len(d.perfRanks) == 0 {
+			b.WriteString(styleMuted.Render("no containers to rank") + "\n")
+		}
+		b.WriteString(d.perfTbl.View() + "\n")
+		return pinFooter(b.String(), footer, d.width, d.height)
 	}
 	if d.showDisk {
 		var inner strings.Builder
@@ -673,7 +894,7 @@ func (d *Dashboard) View() string {
 	if d.disconnected {
 		footer = helpLine("c", "reconnect", "esc", "back")
 	} else {
-		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "f", "refresh", "esc", "back")
+		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "p", "perf", "t", "tag", "T", "untag", "a", "errors", "f", "refresh", "esc", "back")
 	}
 	return pinFooter(b.String(), footer, d.width, d.height)
 }

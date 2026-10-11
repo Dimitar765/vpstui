@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,6 +185,134 @@ func atof(s string) float64 {
 	return f
 }
 
+// peakIDPattern guards what the peaks probe interpolates into a shell glob. The
+// app's canonical container id is docker's 12-char short hex form, so anything
+// else — including a name, which is user- and image-controlled — is dropped
+// rather than quoted into a remote command.
+var peakIDPattern = regexp.MustCompile(`^[0-9a-f]{6,64}$`)
+
+// peaksScript reads, per container, the counters the kernel has been keeping
+// since the container started: memory.peak (cgroup v2) or
+// memory.max_usage_in_bytes (v1), and cumulative CPU plus the throttling
+// counters. One docker inspect supplies the start time every id is keyed to.
+//
+// It prints one tab-separated row per id — id, peak bytes, CPU microseconds,
+// nr_throttled, nr_periods, started at — and "-" for anything the host does not
+// expose. It uses only POSIX syntax and no single quotes, so the whole script
+// survives quote().
+const peaksScript = `
+info=$(docker inspect -f "{{.Id}} {{.State.StartedAt}}" "$@" 2>/dev/null)
+one() { for d in $1; do if [ -d "$d" ]; then printf "%s" "$d"; return; fi; done; }
+rd() { if [ -f "$1" ]; then cat "$1" 2>/dev/null; fi; }
+kv() { printf "%s\n" "$1" | grep "^$2 " | cut -d" " -f2; }
+for id in "$@"; do
+  start=$(printf "%s\n" "$info" | grep "^$id" | head -n 1 | cut -d" " -f2)
+  v2=$(one "/sys/fs/cgroup/system.slice/docker-$id*.scope")
+  if [ -z "$v2" ]; then v2=$(one "/sys/fs/cgroup/docker/$id*"); fi
+  v1m=$(one "/sys/fs/cgroup/memory/system.slice/docker-$id*")
+  if [ -z "$v1m" ]; then v1m=$(one "/sys/fs/cgroup/memory/docker/$id*"); fi
+  v1c=$(one "/sys/fs/cgroup/cpu,cpuacct/system.slice/docker-$id*")
+  if [ -z "$v1c" ]; then v1c=$(one "/sys/fs/cgroup/cpuacct/system.slice/docker-$id*"); fi
+  if [ -z "$v1c" ]; then v1c=$(one "/sys/fs/cgroup/cpu/system.slice/docker-$id*"); fi
+  if [ -z "$v1c" ]; then v1c=$(one "/sys/fs/cgroup/cpuacct/docker/$id*"); fi
+  if [ -z "$v1c" ]; then v1c=$(one "/sys/fs/cgroup/cpu,cpuacct/docker/$id*"); fi
+  peak=$(rd "$v2/memory.peak")
+  if [ -z "$peak" ]; then peak=$(rd "$v1m/memory.max_usage_in_bytes"); fi
+  stat=$(rd "$v2/cpu.stat")
+  usec=$(kv "$stat" usage_usec)
+  thr=$(kv "$stat" nr_throttled)
+  per=$(kv "$stat" nr_periods)
+  if [ -z "$usec" ]; then
+    usec=$(rd "$v1c/cpuacct.usage")
+    if [ -n "$usec" ]; then usec=$(expr "$usec" / 1000); fi
+    cstat=$(rd "$v1c/cpu.stat")
+    thr=$(kv "$cstat" nr_throttled)
+    per=$(kv "$cstat" nr_periods)
+  fi
+  if [ -z "$peak" ]; then peak=-; fi
+  if [ -z "$usec" ]; then usec=-; fi
+  if [ -z "$thr" ]; then thr=-; fi
+  if [ -z "$per" ]; then per=-; fi
+  if [ -z "$start" ]; then start=-; fi
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$id" "$peak" "$usec" "$thr" "$per" "$start"
+done
+`
+
+// ContainerPeaks reads the kernel's all-time per-container maxima in one
+// read-only round trip. Ids that are not the short hex form docker reports are
+// skipped, and a host with no readable cgroup returns rows whose counters are
+// models.Unknown rather than an error — the screen can then show "-" beside a
+// container it is still measuring.
+func (e *Executor) ContainerPeaks(ctx context.Context, ids []string) ([]models.ContainerPeak, error) {
+	safe := validPeakIDs(ids)
+	if len(safe) == 0 {
+		return nil, nil
+	}
+	out, err := e.exec(ctx, 10*time.Second, PeaksCommand(safe))
+	if err != nil {
+		return nil, err
+	}
+	return parseContainerPeaks(out), nil
+}
+
+// validPeakIDs keeps only the ids the probe may interpolate into a glob.
+func validPeakIDs(ids []string) []string {
+	var safe []string
+	for _, id := range ids {
+		if peakIDPattern.MatchString(id) {
+			safe = append(safe, id)
+		}
+	}
+	return safe
+}
+
+// PeaksCommand builds the probe for these ids, which must already be filtered by
+// validPeakIDs. Each id is a separate quoted argument, so the script's "$@" is
+// the only place they appear and one hostile string cannot reach the shell.
+func PeaksCommand(ids []string) string {
+	cmd := "sh -c " + quote(peaksScript) + " sh"
+	for _, id := range ids {
+		cmd += " " + quote(id)
+	}
+	return cmd
+}
+
+// parseContainerPeaks parses the rows the probe prints. Extracted to make it
+// testable: a field that is "-", unparseable or missing makes that counter
+// models.Unknown, never a silent zero.
+func parseContainerPeaks(out string) []models.ContainerPeak {
+	var res []models.ContainerPeak
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		f := strings.Split(strings.TrimRight(line, "\r"), "\t")
+		if len(f) < 5 || !peakIDPattern.MatchString(f[0]) {
+			continue
+		}
+		p := models.ContainerPeak{
+			ID:           f[0],
+			MemPeakBytes: numOr(f[1]),
+			CPUUsec:      numOr(f[2]),
+			Throttled:    numOr(f[3]),
+			Periods:      numOr(f[4]),
+		}
+		if len(f) > 5 && f[5] != "-" {
+			p.StartedAt = f[5]
+		}
+		res = append(res, p)
+	}
+	return res
+}
+
+func numOr(s string) int64 {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 0 {
+		return models.Unknown
+	}
+	return n
+}
+
 func (e *Executor) Start(ctx context.Context, id string) error {
 	_, err := e.exec(ctx, 30*time.Second, "docker start "+quote(id))
 	return err
@@ -252,6 +381,26 @@ func (e *Executor) Rm(ctx context.Context, id string) error {
 
 func (e *Executor) StreamLogs(ctx context.Context, id string, tail int) (io.ReadCloser, error) {
 	return e.conn.StreamExec(ctx, "docker logs -f --timestamps --tail "+strconv.Itoa(tail)+" "+quote(id))
+}
+
+// ErrSweepCommand builds one POSIX-shell loop that dumps every container's
+// recent logs — running or not — prefixed with "id<TAB>name<TAB>" so a single
+// SSH round trip carries the whole host. since is a validated duration
+// re-rendered in seconds and tail a clamped int, so nothing user-typed reaches
+// the shell. `|| true` plus the final `exit 0` matter: a container removed
+// between ps and logs would otherwise make docker logs fail, the loop would
+// return that status, and friendly() would turn a nearly-complete payload into
+// an error screen.
+func ErrSweepCommand(since string, tail int) string {
+	return "docker ps -a --format '{{.ID}} {{.Names}}' | while read -r id name; do " +
+		"docker logs --timestamps --since " + quote(since) + " --tail " + strconv.Itoa(tail) + " \"$id\" 2>&1 | " +
+		"awk -v p=\"$id\" -v n=\"$name\" 'BEGIN{OFS=\"\\t\"}{print p,n,$0}' || true; done; exit 0"
+}
+
+// SweepErrors returns the raw sweep payload for this host. On error it still
+// returns whatever was received, so one bad container cannot hide the rest.
+func (e *Executor) SweepErrors(ctx context.Context, since string, tail int) (string, error) {
+	return e.exec(ctx, 25*time.Second, ErrSweepCommand(since, tail))
 }
 
 // ShellCommand builds the SSH-level command for an interactive container

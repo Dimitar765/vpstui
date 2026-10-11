@@ -402,3 +402,105 @@ func TestShellCommand(t *testing.T) {
 		})
 	}
 }
+
+// The sweep is one shell string run on a remote host, so its exact shape is the
+// contract: only validated numbers outside quotes, and an exit status that
+// survives a container disappearing mid-loop.
+func TestErrSweepCommand(t *testing.T) {
+	const want = "docker ps -a --format '{{.ID}} {{.Names}}' | while read -r id name; do " +
+		"docker logs --timestamps --since '7200s' --tail 500 \"$id\" 2>&1 | " +
+		"awk -v p=\"$id\" -v n=\"$name\" 'BEGIN{OFS=\"\\t\"}{print p,n,$0}' || true; done; exit 0"
+	if got := ErrSweepCommand("7200s", 500); got != want {
+		t.Errorf("ErrSweepCommand() = %q,\n want               %q", got, want)
+	}
+
+	// A hostile window can only reach the shell inside single quotes, and the
+	// tail is an int: nothing in the command is an unquoted expansion.
+	hostile := ErrSweepCommand(`7200s'; rm -rf /`, 0)
+	if !strings.Contains(hostile, `'7200s'\''; rm -rf /'`) {
+		t.Errorf("since not escaped: %q", hostile)
+	}
+	if !strings.Contains(hostile, "--tail 0 ") {
+		t.Errorf("tail not a bare number: %q", hostile)
+	}
+	for _, frag := range []string{"|| true", "; exit 0", "2>&1", "--timestamps", `"$id"`} {
+		if !strings.Contains(hostile, frag) {
+			t.Errorf("command is missing %q: %q", frag, hostile)
+		}
+	}
+}
+
+// The peaks probe is one shell string run on a remote host, so its shape is the
+// contract: the ids are separate quoted arguments and never part of the script.
+func TestPeaksCommand(t *testing.T) {
+	ids := []string{"8f30766c1db2", "4bc22d376cec"}
+	got := PeaksCommand(ids)
+	if got != PeaksCommand(ids) {
+		t.Error("command is not byte-stable for the same ids")
+	}
+	if !strings.HasPrefix(got, "sh -c '") || !strings.HasSuffix(got, "' sh '8f30766c1db2' '4bc22d376cec'") {
+		t.Errorf("unexpected command shape: %q", got)
+	}
+	// The script carries no single quotes, so quote() adds no escapes and the
+	// ids stay the only quoted arguments.
+	if strings.Contains(peaksScript, "'") {
+		t.Error("peaksScript contains a single quote; quote() would have to escape it")
+	}
+	// A hostile id is dropped, not escaped into the argument list.
+	one := PeaksCommand([]string{"8f30766c1db2"})
+	hostile := PeaksCommand(validPeakIDs([]string{"8f30766c1db2", "x'; rm -rf /", "$(reboot)", "TOO-SHORT"}))
+	if hostile != one {
+		t.Errorf("invalid ids changed the command: %q", hostile)
+	}
+	for _, frag := range []string{"docker inspect", "memory.peak", "memory.max_usage_in_bytes",
+		"usage_usec", "cpuacct.usage", "nr_throttled", `printf "%s\t%s`, "-d\" \"", "for id in \"$@\""} {
+		if !strings.Contains(got, frag) {
+			t.Errorf("command is missing %q", frag)
+		}
+	}
+	if len(validPeakIDs(nil)) != 0 {
+		t.Error("no ids must mean no probe")
+	}
+}
+
+func TestParseContainerPeaks(t *testing.T) {
+	// Real rows, as this machine's cgroup v2 emits them.
+	v2 := "8f30766c1db2\t1852186624\t3768589852\t0\t0\t2026-10-10T20:03:29.692717076Z\n"
+	got := parseContainerPeaks(v2)
+	if len(got) != 1 {
+		t.Fatalf("rows = %d; want 1", len(got))
+	}
+	want := models.ContainerPeak{
+		ID: "8f30766c1db2", MemPeakBytes: 1852186624, CPUUsec: 3768589852,
+		Throttled: 0, Periods: 0, StartedAt: "2026-10-10T20:03:29.692717076Z",
+	}
+	if !reflect.DeepEqual(got[0], want) {
+		t.Errorf("row = %+v,\nwant %+v", got[0], want)
+	}
+
+	// A host with nothing readable reports every counter as unknown. Zero is a
+	// measurement — 0 throttled periods is a fact, "-" is not.
+	none := parseContainerPeaks("8f30766c1db2\t-\t-\t-\t-\t-\n")
+	if none[0].MemPeakBytes != models.Unknown || none[0].CPUUsec != models.Unknown ||
+		none[0].Throttled != models.Unknown || none[0].Periods != models.Unknown {
+		t.Errorf("dash row parsed as %+v", none[0])
+	}
+	if none[0].StartedAt != "" {
+		t.Errorf("start time invented: %q", none[0].StartedAt)
+	}
+
+	// cgroup v1 gives nanoseconds, which the script already scaled; garbage in a
+	// field makes only that field unknown.
+	mixed := parseContainerPeaks("054a4270e27b\t82149376\tnotanumber\t12\t4000\t2026-10-10T20:03:29Z\n")
+	if mixed[0].MemPeakBytes != 82149376 || mixed[0].CPUUsec != models.Unknown ||
+		mixed[0].Throttled != 12 || mixed[0].Periods != 4000 {
+		t.Errorf("mixed row parsed as %+v", mixed[0])
+	}
+
+	for _, bad := range []string{"", "\n", "not-a-row\n", "zzzzzzzzzzzz\t1\t2\t3\t4\t5\n",
+		"8f30766c1db2\t1\t2\t3\n", "shell noise: cat: not found\n"} {
+		if rows := parseContainerPeaks(bad); len(rows) != 0 {
+			t.Errorf("parseContainerPeaks(%q) returned %d rows", bad, len(rows))
+		}
+	}
+}
