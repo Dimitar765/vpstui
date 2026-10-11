@@ -43,9 +43,17 @@ func Load() ([]models.Host, error) {
 	}
 	var hosts []models.Host
 	if err := json.Unmarshal(data, &hosts); err != nil {
-		return nil, fmt.Errorf("corrupt hosts file %s: %w", p, err)
+		renameAside(p)
+		return nil, fmt.Errorf("corrupt hosts file %s — renamed to %s.bad: %w", p, p, err)
 	}
 	return hosts, nil
+}
+
+// renameAside moves a file the loader could not parse out of the way, so the
+// original bytes survive as <path>.bad when a later Save writes a fresh file.
+// os.Rename replaces any prior .bad.
+func renameAside(path string) {
+	_ = os.Rename(path, path+".bad")
 }
 
 func Save(hosts []models.Host) error {
@@ -56,20 +64,22 @@ func Save(hosts []models.Host) error {
 	return writeJSON(p, hosts)
 }
 
-// writeJSON replaces a file atomically at 0600. Every vpstui config document
-// goes through here: a crash mid-write must never leave a half-written hosts or
-// tags file that the next start would refuse to load.
-func writeJSON(path string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
+// WriteFileAtomic replaces path with data atomically and durably at perm:
+// the temp file is fsynced before the rename and the parent directory after
+// it, so a crash can never leave the rename applied with empty or partial
+// content. Every vpstui config document goes through here.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(append(data, '\n')); err != nil {
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -78,5 +88,22 @@ func writeJSON(path string, v any) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+	return nil
+}
+
+// writeJSON marshals v and stores it atomically at 0600.
+func writeJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return WriteFileAtomic(path, append(data, '\n'), 0600)
 }

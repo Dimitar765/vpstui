@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"vpstui/internal/docker"
 	"vpstui/internal/models"
 )
 
@@ -348,7 +349,9 @@ func TestActionDoneBatchRefetchesDisk(t *testing.T) {
 }
 
 func mkDash(state string) *Dashboard {
-	d := NewDashboard(host("h"), nil, 80, 24, 1)
+	// A real Executor wrapping no connection: fetchNow hands out commands as
+	// it would in production, but no test executes them.
+	d := NewDashboard(host("h"), docker.New(nil), 80, 24, 1)
 	d.containers = []models.Container{{ID: "c1", Names: "c1", State: state, Status: state}}
 	d.rebuild()
 	d.tbl.SetCursor(0)
@@ -416,5 +419,36 @@ func TestStaleShellMsgDropped(t *testing.T) {
 	_, cmd = m.Update(shellProbeDoneMsg{msgTag: msgTag{hostID: "a", gen: 99}, req: containerReq{id: "c1", name: "c1"}})
 	if cmd != nil {
 		t.Fatal("unknown-gen probe result produced a command")
+	}
+}
+
+// Toast and status expiry happen in Update, never in View: a message must
+// survive an arbitrary number of repaints and clear on its expiry event.
+func TestToastSurvivesRepaintClearsOnTick(t *testing.T) {
+	d := mkDash("running")
+	d.SetToast("restarted c1", false)
+	v1, v2 := d.View(), d.View()
+	if !strings.Contains(v1, "restarted c1") || !strings.Contains(v2, "restarted c1") {
+		t.Fatalf("toast lost on repaint:\n%q\n%q", v1, v2)
+	}
+	d.Update(statsTickMsg{msgTag: msgTag{hostID: "h", gen: 1}})
+	if v := d.View(); strings.Contains(v, "restarted c1") {
+		t.Fatalf("toast survived the 2s tick: %q", v)
+	}
+	if d.toast != "" {
+		t.Fatalf("toast field not cleared: %q", d.toast)
+	}
+}
+
+func TestStatusSurvivesRepaintClearsOnKey(t *testing.T) {
+	m := New(nil, nil) // view defaults to viewHosts
+	m.status = "connect h failed: dial tcp 127.0.0.1"
+	v1, v2 := m.View(), m.View()
+	if !strings.Contains(v1, "connect h failed") || !strings.Contains(v2, "connect h failed") {
+		t.Fatalf("status lost on repaint:\n%q\n%q", v1, v2)
+	}
+	m.Update(key("j"))
+	if m.status != "" {
+		t.Fatalf("status survived keypress: %q", m.status)
 	}
 }

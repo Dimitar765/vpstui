@@ -9,7 +9,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -20,10 +22,16 @@ import (
 	"vpstui/internal/models"
 )
 
+// ErrConnLost reports that the SSH connection died or was closed underneath an
+// operation. Exec and StreamExec wrap their error with it; the app layer keys
+// reconnect decisions on errors.Is instead of matching message text.
+var ErrConnLost = errors.New("ssh: connection lost")
+
 type Conn struct {
 	client    *ssh.Client
 	keepStop  chan struct{}
 	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 func knownHostsPath() (string, error) {
@@ -94,11 +102,20 @@ func Dial(ctx context.Context, h models.Host, secret string) (*Conn, error) {
 
 	if len(toAccept) > 0 {
 		f, err := os.OpenFile(kPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err == nil {
-			for _, line := range toAccept {
-				fmt.Fprintln(f, line)
+		if err != nil {
+			client.Close()
+			return nil, fmt.Errorf("first-use host key pin failed: %w", err)
+		}
+		for _, line := range toAccept {
+			if _, err := fmt.Fprintln(f, line); err != nil {
+				f.Close()
+				client.Close()
+				return nil, fmt.Errorf("first-use host key pin failed: %w", err)
 			}
-			f.Close()
+		}
+		if err := f.Close(); err != nil {
+			client.Close()
+			return nil, fmt.Errorf("first-use host key pin failed: %w", err)
 		}
 	}
 
@@ -113,7 +130,19 @@ func authMethods(h models.Host, secret string) ([]ssh.AuthMethod, error) {
 		if secret == "" {
 			return nil, fmt.Errorf("no password provided")
 		}
-		return []ssh.AuthMethod{ssh.Password(secret)}, nil
+		return []ssh.AuthMethod{
+			ssh.Password(secret),
+			// PAM hosts that reject plain "password" auth still accept the
+			// same secret through keyboard-interactive. Every prompt gets the
+			// password; a wrong one fails the round as usual.
+			ssh.KeyboardInteractive(func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+				answers := make([]string, len(questions))
+				for i := range questions {
+					answers[i] = secret
+				}
+				return answers, nil
+			}),
+		}, nil
 	case models.AuthKey:
 		if h.KeyPath == "" {
 			return nil, fmt.Errorf("no private key path configured")
@@ -150,15 +179,20 @@ func authMethods(h models.Host, secret string) ([]ssh.AuthMethod, error) {
 		if sock == "" {
 			return nil, fmt.Errorf("SSH_AUTH_SOCK is not set; no ssh-agent available")
 		}
-		cl, err := net.Dial("unix", sock)
+		// The socket stays open on success: the returned agent signers proxy
+		// every Sign call through it during the handshake, so closing it here
+		// would break agent auth. The error paths below close what they can.
+		cl, err := net.DialTimeout("unix", sock, 5*time.Second)
 		if err != nil {
 			return nil, fmt.Errorf("ssh-agent: %w", err)
 		}
 		signers, err := agent.NewClient(cl).Signers()
 		if err != nil {
+			cl.Close()
 			return nil, fmt.Errorf("ssh-agent signers: %w", err)
 		}
 		if len(signers) == 0 {
+			cl.Close()
 			return nil, fmt.Errorf("ssh-agent has no identities")
 		}
 		return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil
@@ -167,31 +201,111 @@ func authMethods(h models.Host, secret string) ([]ssh.AuthMethod, error) {
 	}
 }
 
+// keepalive probes the transport every 30s. Each probe gets 10s to answer;
+// two consecutive failures — timeout or error — close the connection, so a
+// dead link is detected without a budget of one flaky probe, and the typed
+// ErrConnLost signal reaches the session's next exec.
 func (c *Conn) keepalive() {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
+	failures := 0
 	for {
 		select {
 		case <-t.C:
-			if _, _, err := c.client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
-				c.Close()
-				return
+			res := make(chan error, 1)
+			go func() {
+				_, _, err := c.client.SendRequest("keepalive@openssh.com", true, nil)
+				res <- err
+			}()
+			var err error
+			select {
+			case err = <-res:
+			case <-time.After(10 * time.Second):
+				err = errors.New("keepalive probe timed out")
 			}
+			if err != nil {
+				failures++
+				if failures >= 2 {
+					c.Close()
+					return
+				}
+				continue
+			}
+			failures = 0
 		case <-c.keepStop:
 			return
 		}
 	}
 }
 
+// maxExecBytes bounds how much output Exec buffers per stream. Sweep output is
+// re-capped (and truncation detected) downstream; this only keeps a chatty
+// command from exhausting client memory inside its timeout window.
+const maxExecBytes = 64 << 20
+
+// limitWriter buffers up to max bytes and silently discards the rest.
+type limitWriter struct {
+	buf  bytes.Buffer
+	max  int
+	full bool
+}
+
+func newLimitWriter(max int) *limitWriter { return &limitWriter{max: max} }
+
+func (w *limitWriter) Write(p []byte) (int, error) {
+	if w.full {
+		return len(p), nil
+	}
+	n := len(p)
+	if spare := w.max - w.buf.Len(); n > spare {
+		n = spare
+		w.full = true
+	}
+	w.buf.Write(p[:n])
+	return len(p), nil
+}
+
+func (w *limitWriter) String() string { return w.buf.String() }
+
+// isConnErr recognizes, textually, the transport failures ssh reports for a
+// dead or closed connection. It backs ErrConnLost wrapping for drops the
+// keepalive has not flagged yet — the closed flag only covers the reverse
+// order. The list lives here, inside sshclient; the app layer never
+// string-matches transport errors.
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, frag := range []string{"connection lost", "eof", "use of closed", "broken pipe"} {
+		if strings.Contains(s, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// connLost types err as ErrConnLost when the connection is closed or the error
+// looks like a transport failure. nil passes through unchanged.
+func (c *Conn) connLost(err error) error {
+	if err == nil {
+		return nil
+	}
+	if c.closed.Load() || isConnErr(err) {
+		return fmt.Errorf("%w: %v", ErrConnLost, err)
+	}
+	return err
+}
+
 // Exec runs cmd and returns buffered stdout/stderr. ctx controls the timeout.
 func (c *Conn) Exec(ctx context.Context, cmd string) (string, string, error) {
 	sess, err := c.client.NewSession()
 	if err != nil {
-		return "", "", err
+		return "", "", c.connLost(err)
 	}
-	var out, errb bytes.Buffer
-	sess.Stdout = &out
-	sess.Stderr = &errb
+	out, errb := newLimitWriter(maxExecBytes), newLimitWriter(maxExecBytes)
+	sess.Stdout = out
+	sess.Stderr = errb
 
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(cmd) }()
@@ -199,10 +313,17 @@ func (c *Conn) Exec(ctx context.Context, cmd string) (string, string, error) {
 	select {
 	case <-ctx.Done():
 		_ = sess.Close()
-		return out.String(), errb.String(), ctx.Err()
+		// sess.Close makes the Run goroutine return, but it may still be
+		// writing into the buffers; drain with a grace period so the reads
+		// below never race a live write.
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		return out.String(), errb.String(), c.connLost(ctx.Err())
 	case err := <-done:
 		_ = sess.Close()
-		return out.String(), errb.String(), err
+		return out.String(), errb.String(), c.connLost(err)
 	}
 }
 
@@ -231,7 +352,7 @@ func (s *stream) Close() error               { s.cancel(); return s.sess.Close()
 func (c *Conn) StreamExec(ctx context.Context, cmd string) (io.ReadCloser, error) {
 	sess, err := c.client.NewSession()
 	if err != nil {
-		return nil, err
+		return nil, c.connLost(err)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
@@ -243,7 +364,7 @@ func (c *Conn) StreamExec(ctx context.Context, cmd string) (io.ReadCloser, error
 		cancel()
 		pw.Close()
 		sess.Close()
-		return nil, err
+		return nil, c.connLost(err)
 	}
 
 	go func() {
@@ -269,6 +390,7 @@ func (c *Conn) StreamExec(ctx context.Context, cmd string) (io.ReadCloser, error
 func (c *Conn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		c.closed.Store(true)
 		close(c.keepStop)
 		err = c.client.Close()
 	})

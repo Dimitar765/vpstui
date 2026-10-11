@@ -365,9 +365,14 @@ func TestTagPromptKeys(t *testing.T) {
 	m.Update(key("t"))
 	m.tag.in.SetValue("mail")
 	m.Update(key("tab"))
-	m.Update(key("enter"))
+	_, cmd := m.Update(key("enter"))
 	if m.tag.active {
 		t.Error("enter left the prompt open")
+	}
+	// The write runs off the UI thread; executing its command is what the
+	// runtime does with every returned command.
+	if cmd != nil {
+		cmd()
 	}
 	if got := s.dash.tbl.rows[0][0]; got != "mail odysseus-postfix-1" {
 		t.Errorf("committed table cell = %q", got)

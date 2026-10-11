@@ -10,6 +10,7 @@ package perf
 
 import (
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -101,15 +102,17 @@ func (b *Buffer) trim(id string, at time.Time) {
 // next Record.
 func (b *Buffer) Series(now time.Time, id string, window time.Duration) []Sample {
 	all := b.series[id]
-	from := now.Add(-window)
-	// Samples are appended in time order, so the window is a suffix; scanning
-	// from the front would walk the whole ring on every repaint.
-	for i, s := range all {
-		if !s.At.Before(from) {
-			return all[i:]
-		}
+	if len(all) == 0 {
+		return nil
 	}
-	return nil
+	// Samples are appended in time order, so the window is a suffix; binary
+	// search finds its first sample without walking the stale head of the ring.
+	from := now.Add(-window)
+	i := sort.Search(len(all), func(i int) bool { return !all[i].At.Before(from) })
+	if i == len(all) {
+		return nil
+	}
+	return all[i:]
 }
 
 // Total sums every kept sample, which is what the perf header reports as the

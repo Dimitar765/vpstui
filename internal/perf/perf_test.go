@@ -122,6 +122,39 @@ func TestSeriesWindowsByTime(t *testing.T) {
 	}
 }
 
+// A full ring keeps a stale prefix that the window excludes; Series must find
+// the in-window suffix without walking that head.
+func TestSeriesSkipsStalePrefixOfLongRing(t *testing.T) {
+	base := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	const n = 900
+	b := New(n, time.Hour)
+	for i := range n {
+		b.Record(base.Add(time.Duration(i)*time.Minute), []models.ContainerStats{
+			stats("aaa", "1.00%", "1MiB / 2GiB"),
+		})
+	}
+	now := base.Add((n - 1) * time.Minute)
+	got := b.Series(now, "aaa", 20*time.Minute)
+	if len(got) != 21 {
+		t.Fatalf("window len = %d; want 21 (t-20m..now inclusive)", len(got))
+	}
+	wantFirst := now.Add(-20 * time.Minute)
+	if !got[0].At.Equal(wantFirst) || !got[len(got)-1].At.Equal(now) {
+		t.Errorf("window = [%v..%v], want [%v..%v]", got[0].At, got[len(got)-1].At, wantFirst, now)
+	}
+	for i := 1; i < len(got); i++ {
+		if !got[i-1].At.Before(got[i].At) {
+			t.Fatalf("window out of order at %d", i)
+		}
+	}
+	// A window that starts after the last sample keeps nothing. (Before the
+	// first is impossible to distinguish from a full window: samples are only
+	// ever appended with past timestamps, so Series is suffix-shaped.)
+	if s := b.Series(now.Add(2*time.Hour), "aaa", 30*time.Minute); s != nil {
+		t.Errorf("window after every sample = %v; want nil", s)
+	}
+}
+
 func TestTrimHonoursCapAndHorizon(t *testing.T) {
 	base := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
 

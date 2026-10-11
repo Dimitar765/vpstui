@@ -95,7 +95,9 @@ func sweepRow(row string) (id, name, line string, ok bool) {
 
 // parseErrSweep turns one host's payload into kept lines. It runs inside the
 // command goroutine, never in Update, because a 4 MiB payload is far too much
-// work for the UI thread. The second return reports that the payload was cut.
+// work for the UI thread. The second return reports that the payload was cut —
+// by the byte cap or by the corpus line cap, which runs before signature()
+// so the regexes only ever see the lines that survive.
 func parseErrSweep(payload, hostID, hostName string, sweptAt time.Time) ([]ErrLine, bool) {
 	truncated := false
 	if len(payload) > errSweepBytesCap {
@@ -137,8 +139,18 @@ func parseErrSweep(payload, hostID, hostName string, sweptAt time.Time) ([]ErrLi
 		out = append(out, ErrLine{
 			HostID: hostID, HostName: hostName,
 			ID: id, Name: name, Stamp: stamp, At: at,
-			Sev: sev, Sig: signature(rest), Text: rest,
+			Sev: sev, Text: rest,
 		})
+	}
+	if len(out) > errCorpusCap {
+		// Keep the newest before signing: grouping downstream computes
+		// counts/firstSeen/lastSeen from this same final set, so cap-then-group
+		// and group-then-cap produce identical groups.
+		out = out[len(out)-errCorpusCap:]
+		truncated = true
+	}
+	for i := range out {
+		out[i].Sig = signature(out[i].Text)
 	}
 	return out, truncated
 }

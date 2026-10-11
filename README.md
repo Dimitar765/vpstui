@@ -6,15 +6,20 @@ VPS servers over SSH, written in Go.
 ## Features
 
 - **Host manager** — add/edit/delete VPS entries, persisted to
-  `~/.config/vpstui/hosts.json` (mode 0600, atomic writes).
+  `~/.config/vpstui/hosts.json` (mode 0600, atomic writes). A corrupt
+  hosts or tags file is renamed aside to `<file>.bad` on load and never
+  overwritten, so your data survives a bad edit.
 - **SSH auth** — password, private key (optional passphrase), or ssh-agent.
   First-connect trust-on-first-use into `~/.config/vpstui/known_hosts`;
   a changed host key blocks the connection.
 - **Dashboard** — live host metrics (load, memory, CPUs, uptime) and a
   container table (state, status, CPU %, MEM %) refreshed every 2s, all
-  computed by running `docker ps` / `docker stats --no-stream` over SSH.
-  Columns adapt to the terminal width; running/exited/other states are
-  color-coded and high CPU/MEM readings highlight as they climb.
+  computed by one batched `docker ps` / `docker stats --no-stream` exec over
+  SSH. Columns adapt to the terminal width; running/exited/other states are
+  color-coded and high CPU/MEM readings highlight as they climb. If the SSH
+  connection drops, vpstui retries once automatically after ~5s; if that also
+  fails it shows the "connection lost — press c to reconnect" banner and `c`
+  redials by hand.
 - **Container actions** — start (`s`), stop (`x`), restart (`r`), remove (`D`,
   stopped containers only) with `y/N` confirmation. Containers are grouped by
   compose project (fold with `space`), details via `d`.

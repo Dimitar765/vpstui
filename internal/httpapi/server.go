@@ -12,6 +12,18 @@ import (
 //go:embed web/index.html
 var web embed.FS
 
+// indexHTML is read once at init: the page is embedded, so re-reading it per
+// request only paid an embed.FS walk and an allocation on every poll.
+var indexHTML = func() []byte {
+	page, err := web.ReadFile("web/index.html")
+	if err != nil {
+		// embed.FS membership is a compile-time guarantee, so this is purely
+		// defensive; serve a visible stub rather than a panic.
+		return []byte("<!doctype html><title>vpstui</title><p>dashboard unavailable</p>")
+	}
+	return page
+}()
+
 const defaultAddr = "127.0.0.1:8712"
 
 // loopbackOnly reports whether addr binds a loopback interface only, so a
@@ -59,5 +71,6 @@ func NewServer(store *Store, addr string) *http.Server {
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 }

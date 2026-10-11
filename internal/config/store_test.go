@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,47 @@ func TestLoadMissingFile(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("Load on missing file = %+v, want nil", got)
+	}
+}
+
+// A corrupt file must never be silently destroyed by the next Save: Load moves
+// it aside as <path>.bad, names that in the error, and Save writes fresh.
+func TestLoadCorruptFileIsRenamedAsideNotOverwritten(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	p, err := hostsPath()
+	if err != nil {
+		t.Fatalf("hostsPath: %v", err)
+	}
+	garbage := []byte("this is not json at all")
+	if err := os.WriteFile(p, garbage, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "renamed") {
+		t.Fatalf("Load error = %v, want it to mention renamed", err)
+	}
+	bad, err := os.ReadFile(p + ".bad")
+	if err != nil {
+		t.Fatalf("ReadFile(.bad): %v", err)
+	}
+	if !bytes.Equal(bad, garbage) {
+		t.Fatalf(".bad = %q, want the original bytes %q", bad, garbage)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("corrupt file still present after Load (stat err = %v)", err)
+	}
+	if err := Save(sampleHosts()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	after, err := os.ReadFile(p + ".bad")
+	if err != nil {
+		t.Fatalf(".bad vanished after Save: %v", err)
+	}
+	if !bytes.Equal(after, garbage) {
+		t.Fatalf(".bad changed after Save: %q", after)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load after fresh Save: %v", err)
 	}
 }
 
