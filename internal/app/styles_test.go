@@ -53,15 +53,37 @@ func TestPanelFraming(t *testing.T) {
 }
 
 func TestLogsViewFramed(t *testing.T) {
-	c := NewContainerView("abcdef0123456789", "web", 80, 30)
-	v := c.View()
-	if !strings.Contains(v, "╭") {
-		t.Error("logs viewport should be framed")
+	modes := []struct {
+		name   string
+		prep   func(*ContainerView)
+		status string
+	}{
+		{"streaming", func(*ContainerView) {}, "streaming"},
+		{"filter", func(c *ContainerView) { c.applyQuery("err") }, "streaming"},
+		{"highlight", func(c *ContainerView) { c.applyQuery("err"); c.toggleMode() }, "streaming"},
+		{"scrolled up", func(c *ContainerView) { _, _ = c.Update(key("g")) }, "streaming"},
+		{"typing", func(c *ContainerView) { c.searching = true }, "⌕"},
 	}
-	if !strings.Contains(v, "streaming") {
-		t.Error("missing stream status")
-	}
-	if h := lipgloss.Height(v); h != 30 {
-		t.Errorf("logs height = %d, want 30 (pinned frame)", h)
+	for _, m := range modes {
+		t.Run(m.name, func(t *testing.T) {
+			c := NewContainerView("abcdef0123456789", "web", 80, 30)
+			feed(c, "alpha", "ERROR one", "beta")
+			c.flush()
+			m.prep(c)
+			v := c.View()
+			if !strings.Contains(v, "╭") {
+				t.Error("logs viewport should be framed")
+			}
+			if !strings.Contains(v, m.status) {
+				t.Errorf("missing status %q: %q", m.status, v)
+			}
+			if h := lipgloss.Height(v); h != 30 {
+				t.Errorf("logs height = %d, want 30 (pinned frame)", h)
+			}
+			// A help bar that wraps at 80 columns is what would break the frame.
+			if w := lipgloss.Width(v); w > 80 {
+				t.Errorf("logs width = %d, want ≤ 80", w)
+			}
+		})
 	}
 }

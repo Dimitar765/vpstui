@@ -4,32 +4,122 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"vpstui/internal/docker"
 )
+
+// History bounds. Trimming drops from the cap down to the floor rather than
+// one line at a time, because a trim invalidates every styled row and forces a
+// rebuild: halving keeps that off the hot path. These are vars so tests can
+// drive the trim path without generating eight megabytes of logs.
+var (
+	logBytesCap  = 8 << 20
+	logBytesKeep = 4 << 20
+	logLinesCap  = 100_000
+	logLinesKeep = 50_000
+)
+
+const (
+	// logLevelScanBytes bounds the window a line is searched for a severity
+	// word, so a long message body cannot recolour its own line.
+	logLevelScanBytes = 120
+	logQueryShowRunes = 24
+	logFlushEvery     = 150 * time.Millisecond
+	defaultLogTail    = 2000
+	maxLogTail        = 100_000
+)
+
+// logSev is a coarse severity class inferred from the text; docker gives us no
+// structured level.
+type logSev int
+
+const (
+	lvlNone logSev = iota
+	lvlDebug
+	lvlInfo
+	lvlWarn
+	lvlError
+)
+
+var logSevs = map[string]logSev{
+	"err":       lvlError,
+	"error":     lvlError,
+	"fatal":     lvlError,
+	"crit":      lvlError,
+	"critical":  lvlError,
+	"panic":     lvlError,
+	"emergency": lvlError,
+	"warn":      lvlWarn,
+	"warning":   lvlWarn,
+	"info":      lvlInfo,
+	"notice":    lvlInfo,
+	"debug":     lvlDebug,
+	"trace":     lvlDebug,
+	"verbose":   lvlDebug,
+}
+
+var logMarkerRow = styleMuted.Render("… (older lines dropped) …")
+
+func levelStyle(s logSev) lipgloss.Style {
+	switch s {
+	case lvlError:
+		return styleErr
+	case lvlWarn:
+		return styleWarn
+	case lvlDebug:
+		return styleMuted
+	}
+	return lipgloss.NewStyle()
+}
 
 type ContainerView struct {
 	id, name string
 	hostID   string
 	gen      uint64
 	vp       viewport.Model
-	buf      strings.Builder
-	err      string
-	running  bool
-	width    int
-	height   int
+
+	lines []string // raw log lines, oldest first
+	size  int      // bytes held by lines, counting one newline per line
+	rows  []string // styled, filtered rows — what the viewport shows
+	hits  []int    // indices into rows matching query (highlight mode only)
+
+	query     string
+	hide      bool // true: drop non-matching rows; false: keep all and bold matches
+	searching bool
+	in        textinput.Model
+
+	pending int
+	follow  bool // stick to the bottom as lines arrive
+	dropped bool // history has been trimmed, so rows[0] is the marker
+	dirty   bool // rows changed since the last SetContent
+	err     string
+	running bool
+	width   int
+	height  int
 
 	cancel context.CancelFunc
 	reader io.ReadCloser
 }
 
 func NewContainerView(id, name string, w, h int) *ContainerView {
-	c := &ContainerView{id: id, name: name, running: true, width: w, height: h}
+	c := &ContainerView{
+		id: id, name: name, running: true, follow: true, hide: true,
+		width: w, height: h,
+	}
 	c.vp = viewport.New(max(w-6, 20), max(h-6, 5))
+	c.in = textinput.New()
+	c.in.Placeholder = "filter"
+	c.in.CharLimit = 64
+	c.in.Width = logQueryShowRunes
 	return c
 }
 
@@ -37,7 +127,7 @@ func NewContainerView(id, name string, w, h int) *ContainerView {
 // send via streamLogs.
 func (c *ContainerView) Open(dock *docker.Executor, id string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	r, err := dock.StreamLogs(ctx, id)
+	r, err := dock.StreamLogs(ctx, id, logTail())
 	if err != nil {
 		cancel()
 		return nil, err
@@ -55,10 +145,21 @@ func (c *ContainerView) Stop() {
 		c.reader.Close()
 	}
 	c.running = false
+	c.flush()
 }
 
 func (c *ContainerView) tag(hostID string, gen uint64) bool {
 	return c.hostID == hostID && c.gen == gen
+}
+
+// StreamDone ends the stream and flushes, so the last batch is not lost when
+// docker exits or the connection drops.
+func (c *ContainerView) StreamDone(err error) {
+	c.running = false
+	if err != nil {
+		c.err = err.Error()
+	}
+	c.flush()
 }
 
 func streamLogs(r io.ReadCloser, send func(tea.Msg), t msgTag) {
@@ -81,27 +182,173 @@ func streamLogs(r io.ReadCloser, send func(tea.Msg), t msgTag) {
 	}
 }
 
+// Append records lines and styles only what is new. It deliberately does not
+// touch the viewport: see flush.
 func (c *ContainerView) Append(chunk string) {
-	c.buf.WriteString(chunk)
-	if c.buf.Len() > 512*1024 {
-		trimmed := c.buf.String()[c.buf.Len()-256*1024:]
-		c.buf.Reset()
-		c.buf.WriteString("… (older lines dropped) …\n")
-		c.buf.WriteString(trimmed)
+	text := strings.TrimSuffix(chunk, "\n")
+	start := len(c.lines)
+	for _, line := range strings.Split(text, "\n") {
+		c.size += len(line) + 1
+		c.lines = append(c.lines, line)
 	}
-	atBottom := c.vp.AtBottom()
-	c.vp.SetContent(c.buf.String())
-	if atBottom || c.running {
-		c.vp.GotoBottom()
+	if c.size > logBytesCap || len(c.lines) > logLinesCap {
+		c.trimHistory()
+		return
+	}
+	for _, line := range c.lines[start:] {
+		c.pushRow(line)
 	}
 }
 
-func (c *ContainerView) StreamDone(err error) {
-	c.running = false
-	if err != nil {
-		c.err = err.Error()
+func (c *ContainerView) pushRow(line string) {
+	if c.query != "" && !containsFold(line, c.query) {
+		if c.hide {
+			return
+		}
+		c.rows = append(c.rows, styleLine(line, c.query, false))
+		c.dirty = true
+		return
+	}
+	c.rows = append(c.rows, styleLine(line, c.query, !c.hide && c.query != ""))
+	if !c.hide && c.query != "" {
+		c.hits = append(c.hits, len(c.rows)-1)
+	}
+	if !c.follow {
+		c.pending++
+	}
+	c.dirty = true
+}
+
+// trimHistory drops whole lines until the floors are met, then rebuilds every
+// row. Dropping whole lines is also why no line can be sliced in half anymore.
+func (c *ContainerView) trimHistory() {
+	c.dropped = true
+	drop := 0
+	for (c.size > logBytesKeep || len(c.lines)-drop > logLinesKeep) && drop < len(c.lines) {
+		c.size -= len(c.lines[drop]) + 1
+		drop++
+	}
+	if drop > 0 {
+		c.lines = append(c.lines[:0], c.lines[drop:]...)
+	}
+	c.rebuildRows()
+}
+
+// rebuildRows is the only place rows are built from scratch, so the dropped
+// marker, hits and rows can never disagree.
+func (c *ContainerView) rebuildRows() {
+	rows := c.rows[:0]
+	hits := c.hits[:0]
+	if c.dropped {
+		rows = append(rows, logMarkerRow)
+	}
+	for _, line := range c.lines {
+		matched := c.query == "" || containsFold(line, c.query)
+		if !matched && c.hide {
+			continue
+		}
+		mark := matched && !c.hide && c.query != ""
+		if mark {
+			hits = append(hits, len(rows))
+		}
+		rows = append(rows, styleLine(line, c.query, mark))
+	}
+	c.rows, c.hits = rows, hits
+	c.dirty = true
+	c.flush()
+}
+
+// flush is the only caller of SetContent. The viewport re-splits and re-scans
+// its entire content on every SetContent, so lines are batched behind the
+// logFlushMsg tick instead of rendered one at a time.
+func (c *ContainerView) flush() {
+	if !c.dirty {
+		return
+	}
+	c.dirty = false
+	c.vp.SetContent(strings.Join(c.rows, "\n"))
+	if c.follow {
+		c.vp.GotoBottom()
+		c.pending = 0
 	}
 }
+
+// applyQuery re-filters the whole buffer, which is what makes typing live.
+func (c *ContainerView) applyQuery(q string) {
+	if q == c.query {
+		return
+	}
+	c.query = q
+	c.rebuildRows()
+}
+
+func (c *ContainerView) toggleMode() {
+	if c.query == "" {
+		return
+	}
+	c.hide = !c.hide
+	c.rebuildRows()
+}
+
+// jump moves to the next/previous match. In hide mode every row matches, so it
+// simply walks rows; in highlight mode it seeks the hit list and wraps.
+func (c *ContainerView) jump(dir int) {
+	if c.query == "" || len(c.rows) == 0 {
+		return
+	}
+	if c.hide {
+		c.seek(clampInt(c.vp.YOffset+dir, 0, len(c.rows)-1))
+		return
+	}
+	if len(c.hits) == 0 {
+		return
+	}
+	cur := c.vp.YOffset
+	if dir > 0 {
+		for _, h := range c.hits {
+			if h > cur {
+				c.seek(h)
+				return
+			}
+		}
+		c.seek(c.hits[0])
+		return
+	}
+	for i := len(c.hits) - 1; i >= 0; i-- {
+		if c.hits[i] < cur {
+			c.seek(c.hits[i])
+			return
+		}
+	}
+	c.seek(c.hits[len(c.hits)-1])
+}
+
+func (c *ContainerView) seek(row int) {
+	c.vp.SetYOffset(max(row, 0))
+	c.follow = c.vp.AtBottom()
+	if c.follow {
+		c.pending = 0
+	}
+}
+
+// HandleEscape lets Esc step out of the filter before it leaves the screen:
+// typing → committed filter → no filter → back to the dashboard.
+func (c *ContainerView) HandleEscape() bool {
+	switch {
+	case c.searching:
+		c.searching = false
+		c.in.Blur()
+		return true
+	case c.query != "":
+		c.applyQuery("")
+		return true
+	}
+	return false
+}
+
+// Searching reports whether keys belong to the filter input. Root must not run
+// sessionKeys while it does, or digits and X would switch sessions mid-query.
+func (c *ContainerView) Searching() bool { return c.searching }
 
 func (c *ContainerView) SetSize(w, h int) {
 	c.width, c.height = w, h
@@ -110,23 +357,68 @@ func (c *ContainerView) SetSize(w, h int) {
 }
 
 func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
-	if km, ok := msg.(tea.KeyMsg); ok {
+	km, isKey := msg.(tea.KeyMsg)
+	if isKey && c.searching {
+		if km.String() == "enter" {
+			c.searching = false
+			c.in.Blur()
+			return c, nil
+		}
+		var cmd tea.Cmd
+		c.in, cmd = c.in.Update(msg)
+		c.applyQuery(c.in.Value())
+		return c, cmd
+	}
+	if isKey {
 		switch km.String() {
 		case "g":
 			c.vp.GotoTop()
+			c.follow = false
 			return c, nil
 		case "G":
 			c.vp.GotoBottom()
+			c.follow = true
+			c.pending = 0
+			return c, nil
+		case "/":
+			c.searching = true
+			c.in.SetValue(c.query)
+			c.in.CursorEnd()
+			return c, c.in.Focus()
+		case "m":
+			c.toggleMode()
+			return c, nil
+		case "n":
+			c.jump(1)
+			return c, nil
+		case "N":
+			c.jump(-1)
 			return c, nil
 		}
 	}
 	var cmd tea.Cmd
 	c.vp, cmd = c.vp.Update(msg)
+	if isKey {
+		c.follow = c.vp.AtBottom()
+		if c.follow {
+			c.pending = 0
+		}
+	}
 	return c, cmd
 }
 
 func (c *ContainerView) View() string {
 	title := styleTitle.Render("logs — "+c.name) + " " + styleMuted.Render("["+c.id[:min(len(c.id), 12)]+"]")
+	body := panel(title, c.header()+"\n"+c.vp.View(), c.width-2)
+	return pinFooter(body, c.help(), c.width, c.height)
+}
+
+// header stays on one row: the panel width is fixed, and a wrapped status line
+// would push the pinned footer past the frame.
+func (c *ContainerView) header() string {
+	if c.searching {
+		return styleKey.Render("⌕ ") + c.in.View()
+	}
 	var status string
 	switch {
 	case c.err != "":
@@ -136,6 +428,152 @@ func (c *ContainerView) View() string {
 	default:
 		status = styleOK.Render("● streaming…")
 	}
-	body := panel(title, status+"\n"+c.vp.View(), c.width-2)
-	return pinFooter(body, helpLine("↑/↓ j/k", "scroll", "pgup/pgdn", "page", "g/G", "top/bottom", "esc", "back"), c.width, c.height)
+	if !c.follow && c.pending > 0 {
+		status += "  " + styleWarn.Render("↓ "+strconv.Itoa(c.pending)+" new")
+	}
+	if c.query != "" {
+		status += "  " + styleMuted.Render("⌕ "+quotedTrunc(c.query, logQueryShowRunes)+
+			" "+strconv.Itoa(len(c.rows))+"/"+strconv.Itoa(len(c.lines)))
+	}
+	return status
+}
+
+func (c *ContainerView) help() string {
+	if c.searching {
+		return helpLine("type", "filter", "enter", "apply", "esc", "cancel")
+	}
+	if c.query != "" {
+		want := "highlight"
+		if !c.hide {
+			want = "hide"
+		}
+		return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "edit",
+			"m", want, "n/N", "jump", "esc", "clear")
+	}
+	return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "filter", "esc", "back")
+}
+
+// styleLine renders one raw log line: docker's timestamp dimmed to HH:MM:SS,
+// then the message coloured by level. A line that already carries its own ANSI
+// escapes is left alone — the container's palette wins, and SGR never nests.
+func styleLine(line, query string, mark bool) string {
+	stamp, rest := splitLogStamp(line)
+	var b strings.Builder
+	if stamp != "" {
+		b.WriteString(styleMuted.Render(stamp))
+		if rest != "" {
+			b.WriteString(" ")
+		}
+	}
+	if rest == "" || strings.Contains(rest, "\x1b[") {
+		b.WriteString(rest)
+		return b.String()
+	}
+	st := levelStyle(logLevel(rest))
+	if mark && query != "" {
+		b.WriteString(highlightLine(rest, query, st))
+		return b.String()
+	}
+	b.WriteString(st.Render(rest))
+	return b.String()
+}
+
+// splitLogStamp separates docker's leading RFC3339 timestamp into the
+// wall-clock part and the message. Lines without one (older daemons, some
+// stderr) pass through untouched.
+func splitLogStamp(line string) (stamp, rest string) {
+	i := strings.IndexByte(line, ' ')
+	if i < 20 || !strings.Contains(line[:i], "T") {
+		return "", line
+	}
+	if _, err := time.Parse(time.RFC3339Nano, line[:i]); err != nil {
+		return "", line
+	}
+	return line[11:19], line[i+1:]
+}
+
+// logLevel returns the severity named by the first word in the leading window.
+// Whole words only, so "information" does not read as info.
+func logLevel(s string) logSev {
+	if len(s) > logLevelScanBytes {
+		s = s[:logLevelScanBytes]
+	}
+	for i := 0; i < len(s); {
+		if !isASCIILetter(s[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && isASCIILetter(s[j]) {
+			j++
+		}
+		if sev, ok := logSevs[strings.ToLower(s[i:j])]; ok {
+			return sev
+		}
+		i = j
+	}
+	return lvlNone
+}
+
+func isASCIILetter(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+// containsFold is byte-window case folding, shared with highlightLine so a row
+// counts as a hit exactly when something in it gets bolded.
+func containsFold(s, sub string) bool {
+	if sub == "" {
+		return false
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// highlightLine bolds each occurrence of query. Segments are rendered apart so
+// each closes its own SGR and nothing bleeds into the next run.
+func highlightLine(s, query string, base lipgloss.Style) string {
+	bold := base.Copy().Bold(true)
+	var b strings.Builder
+	run, i, q := 0, 0, len(query)
+	for i+q <= len(s) {
+		if !strings.EqualFold(s[i:i+q], query) {
+			i++
+			continue
+		}
+		if i > run {
+			b.WriteString(base.Render(s[run:i]))
+		}
+		b.WriteString(bold.Render(s[i : i+q]))
+		i += q
+		run = i
+	}
+	if run < len(s) {
+		b.WriteString(base.Render(s[run:]))
+	}
+	return b.String()
+}
+
+func quotedTrunc(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		s = string(r[:n]) + "…"
+	}
+	return `"` + s + `"`
+}
+
+// parseLogTail clamps VPSTUI_LOG_TAIL. Anything unparseable falls back to the
+// default, so a typo cannot ask docker for the whole history.
+func parseLogTail(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 1 {
+		return defaultLogTail
+	}
+	return min(n, maxLogTail)
+}
+
+func logTail() int {
+	return parseLogTail(os.Getenv("VPSTUI_LOG_TAIL"))
 }

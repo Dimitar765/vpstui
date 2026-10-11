@@ -15,6 +15,7 @@ import (
 
 	"vpstui/internal/config"
 	"vpstui/internal/docker"
+	"vpstui/internal/httpapi"
 	"vpstui/internal/models"
 	"vpstui/internal/secret"
 	"vpstui/internal/shell"
@@ -76,6 +77,12 @@ type logEndMsg struct {
 	msgTag
 	err error
 }
+
+// logFlushMsg batches the rows Append recorded, so the viewport pays one
+// SetContent per tick instead of one per log line.
+type logFlushMsg struct {
+	msgTag
+}
 type detailLoadedMsg struct {
 	msgTag
 	detail models.ContainerDetail
@@ -135,6 +142,7 @@ type Model struct {
 
 	send     func(tea.Msg)
 	quitting bool
+	api      *httpapi.Store
 }
 
 func New(hosts []models.Host) *Model {
@@ -143,10 +151,14 @@ func New(hosts []models.Host) *Model {
 		view:   viewHosts,
 		active: -1,
 		sp:     spinner.New(spinner.WithSpinner(spinner.Dot)),
+		api:    httpapi.NewStore(),
 	}
 	m.list = NewHostList(hosts)
 	return m
 }
+
+// HTTPStore exposes the live-session snapshot store to the embedded JSON API.
+func (m *Model) HTTPStore() *httpapi.Store { return m.api }
 
 // Attach lets background goroutines deliver messages to the program.
 func (m *Model) Attach(send func(tea.Msg)) { m.send = send }
@@ -202,6 +214,9 @@ func (m *Model) removeSession(s *Session) {
 			m.active = len(m.sessions) - 1
 		}
 	}
+	if m.api != nil && s.host.ID != "" {
+		m.api.Unpublish(s.host.ID)
+	}
 	m.refreshConnected()
 }
 
@@ -244,7 +259,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
-	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, detailLoadedMsg, diskLoadedMsg, shellExitedMsg, shellProbeDoneMsg:
+	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, shellExitedMsg, shellProbeDoneMsg:
 		return m.route(msg)
 
 	case connectHostReq:
@@ -365,11 +380,18 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case viewContainer:
-		if handled, cmd := m.sessionKeys(msg.String()); handled {
-			return m, cmd
-		}
-		key := msg.String()
 		s := m.activeSession()
+		key := msg.String()
+		// While the filter input has the keys, sessionKeys must not steal
+		// digits or X — a query like "500" would otherwise switch sessions.
+		if s == nil || s.cv == nil || !s.cv.Searching() {
+			if handled, cmd := m.sessionKeys(key); handled {
+				return m, cmd
+			}
+		}
+		if key == "esc" && s != nil && s.cv != nil && s.cv.HandleEscape() {
+			return m, nil // left the filter input, then cleared the filter
+		}
 		if key == "esc" || key == "q" {
 			if s != nil && s.cv != nil {
 				s.cv.Stop()
@@ -481,6 +503,8 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case logEndMsg:
 		t = msg.msgTag
+	case logFlushMsg:
+		t = msg.msgTag
 	case detailLoadedMsg:
 		t = msg.msgTag
 	case diskLoadedMsg:
@@ -504,6 +528,7 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statsLoadedMsg:
 		if s.dash != nil {
 			s.dash, _ = s.dash.Update(msg)
+			m.publish(s)
 		}
 		return m, nil
 	case actionDoneMsg:
@@ -526,6 +551,15 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logEndMsg:
 		if s.cv != nil {
 			s.cv.StreamDone(msg.err)
+		}
+		return m, nil
+	case logFlushMsg:
+		if s.cv == nil {
+			return m, nil
+		}
+		s.cv.flush()
+		if s.cv.running || s.cv.dirty {
+			return m, tickLogs(t.hostID, t.gen)
 		}
 		return m, nil
 	case detailLoadedMsg, diskLoadedMsg:
@@ -673,6 +707,9 @@ func (m *Model) cleanup() {
 	m.sessions = nil
 	m.active = -1
 	m.quitting = true
+	if m.api != nil {
+		m.api.Close()
+	}
 }
 
 func (m *Model) deleteHost(h models.Host) (tea.Model, tea.Cmd) {
@@ -824,6 +861,7 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 	s.dock = docker.New(msg.conn)
 	s.dash = NewDashboard(msg.host, s.dock, m.width, m.height-m.tabRows(), msg.gen)
 	m.refreshConnected()
+	m.publish(s)
 	if m.view == viewConnecting && m.pendingGen == msg.gen {
 		m.view = viewDashboard
 		m.active = m.indexOf(s)
@@ -843,13 +881,23 @@ func startLogStream(s *Session, id string, send func(tea.Msg)) tea.Cmd {
 			return logEndMsg{msgTag: t, err: err}
 		}
 		go streamLogs(r, send, t)
-		return nil
+		// Kick the flush chain; it reschedules itself while the stream lives.
+		return tickLogs(t.hostID, t.gen)
 	}
 }
 
 func tickStats(hostID string, gen uint64) tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
 		return statsTickMsg{msgTag: msgTag{hostID: hostID, gen: gen}}
+	})
+}
+
+// tickLogs paces the log view's SetContent. Rendering per line would make the
+// viewport re-split and re-scan its whole buffer each time, which is quadratic
+// once the history is multiple megabytes.
+func tickLogs(hostID string, gen uint64) tea.Cmd {
+	return tea.Tick(logFlushEvery, func(time.Time) tea.Msg {
+		return logFlushMsg{msgTag: msgTag{hostID: hostID, gen: gen}}
 	})
 }
 

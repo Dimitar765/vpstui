@@ -48,6 +48,7 @@ type Container struct {
 	Status    string
 	CreatedAt string
 	Labels    string
+	Networks  []string // every attached network name, sorted, defaults included
 }
 
 func (c Container) ShortName() string {

@@ -1,0 +1,584 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vpstui — dashboard</title>
+<style>
+  :root {
+    --bg: #10151a;
+    --panel: #171e24;
+    --line: #263039;
+    --fg: #d7dee5;
+    --dim: #74828f;
+    --accent: #4ec9a8;
+    --bad: #e5736f;
+    --warn: #d9a843;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 0 3rem;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.5 var(--mono);
+  }
+  header {
+    display: flex; align-items: baseline; gap: 1rem;
+    padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; background: var(--bg); z-index: 2;
+  }
+  h1 { font-size: 14px; margin: 0; letter-spacing: .06em; text-transform: uppercase; }
+  #status { color: var(--dim); font-size: 12px; }
+  #status.bad { color: var(--bad); }
+  .rate { margin-left: auto; color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: .45rem; }
+  select {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    font: inherit; font-size: 12px; padding: .15rem .3rem;
+  }
+  main { padding: 1.5rem; }
+  #sessions, #network { display: grid; gap: 1.25rem; }
+  /* an author display rule beats the hidden attribute, so undo it explicitly */
+  #sessions[hidden], #network[hidden] { display: none; }
+  nav { display: flex; gap: .3rem; padding: 1rem 1.5rem 0; }
+  nav button {
+    background: none; color: var(--dim); border: 1px solid var(--line); border-bottom: 0;
+    font: inherit; font-size: 12px; padding: .3rem .9rem; cursor: pointer;
+  }
+  nav button:hover { color: var(--fg); }
+  nav button.active { color: var(--accent); background: var(--panel); }
+  .graph { padding: .8rem .9rem; overflow-x: auto; }
+  .graph > svg { display: block; margin: 0 auto; }
+  .note { padding: .6rem .9rem 0; color: var(--dim); font-size: 12px; }
+  svg text { font: 11px var(--mono); }
+  .edge { stroke: #2c3742; }
+  .net-box { fill: #1b2530; stroke: var(--accent); }
+  .net-label { fill: var(--fg); }
+  .ctr-label { fill: var(--dim); }
+  .strip-label { fill: var(--dim); }
+  .panel { background: var(--panel); border: 1px solid var(--line); }
+  .panel > h2 {
+    margin: 0; padding: .65rem .9rem; font-size: 13px; font-weight: 600;
+    border-bottom: 1px solid var(--line); display: flex; gap: .7rem; align-items: baseline;
+  }
+  .target { color: var(--dim); font-weight: 400; font-size: 12px; }
+  .badge { font-size: 11px; padding: .05rem .45rem; border: 1px solid var(--line); color: var(--dim); }
+  .badge.ok { color: var(--accent); border-color: #2c5548; }
+  .badge.bad { color: var(--bad); border-color: #5a3230; }
+  .age { margin-left: auto; font-size: 11px; font-weight: 400; color: var(--dim); }
+  .age.stale { color: var(--warn); }
+  .stats { display: flex; flex-wrap: wrap; gap: .2rem 1.4rem; padding: .7rem .9rem; border-bottom: 1px solid var(--line); font-size: 12px; }
+  .stats b { color: var(--fg); font-weight: 600; }
+  .stats span { color: var(--dim); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .38rem .9rem; border-bottom: 1px solid #1d252c; white-space: nowrap; }
+  th { color: var(--dim); font-weight: 400; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  td.num, th.num { text-align: right; }
+  tr:last-child td { border-bottom: 0; }
+  .state-running { color: var(--accent); }
+  .state-exited { color: var(--bad); }
+  .state-other { color: var(--dim); }
+  .empty { padding: 1.1rem .9rem; color: var(--dim); }
+  .bar { width: 90px; height: 6px; border: 1px solid var(--line); display: inline-block; vertical-align: middle; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .bar > i.warm { background: var(--warn); }
+  .bar > i.hot { background: var(--bad); }
+  .bar.sm { width: 54px; margin-right: .55rem; }
+  .dot { stroke: none; }
+  .dot.ok { fill: var(--accent); }
+  .dot.bad { fill: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>vpstui</h1>
+  <div id="status">connecting…</div>
+  <label class="rate">refresh <select id="rate" title="How often the page re-reads the API"></select></label>
+</header>
+<nav id="tabs">
+  <button type="button" data-tab="sessions">Sessions</button>
+  <button type="button" data-tab="network">Network</button>
+</nav>
+<main>
+  <div id="sessions"></div>
+  <div id="network" hidden></div>
+</main>
+
+<template id="tpl-session">
+  <section class="panel">
+    <h2>
+      <span data-name></span>
+      <span class="target" data-target></span>
+      <span class="badge" data-conn></span>
+      <span class="age" data-age></span>
+    </h2>
+    <div class="stats" data-stats></div>
+    <table>
+      <thead><tr>
+        <th>name</th><th>image</th><th>state</th><th>status</th>
+        <th class="num">cpu</th><th class="num">mem %</th><th class="num">mem usage</th>
+      </tr></thead>
+      <tbody data-rows></tbody>
+    </table>
+  </section>
+</template>
+
+<template id="tpl-row">
+  <tr>
+    <td data-name></td><td data-image></td><td data-state></td><td data-status></td>
+    <td class="num" data-cpu></td><td class="num" data-mem></td><td class="num" data-usage></td>
+  </tr>
+</template>
+
+<template id="tpl-graph">
+  <section class="panel">
+    <h2>
+      <span data-name></span>
+      <span class="target" data-target></span>
+      <span class="badge" data-conn></span>
+      <span class="age" data-age></span>
+    </h2>
+    <div data-graph></div>
+  </section>
+</template>
+
+<script>
+const RATES = [2000, 5000, 10000, 30000, 60000];
+const STALE_AFTER_S = 6;
+
+function loadRate() {
+  const v = Number(localStorage.getItem('vpstui.rate'));
+  return RATES.includes(v) ? v : 5000;
+}
+
+// #network deep-links the graph, which beats the remembered tab when present.
+function loadTab() {
+  const hash = location.hash.slice(1);
+  if (hash === 'network' || hash === 'sessions') return hash;
+  return localStorage.getItem('vpstui.tab') === 'network' ? 'network' : 'sessions';
+}
+
+let pollMs = loadRate();
+let pollTimer = null;
+let tab = loadTab();
+let busy = false;
+let ageRefs = [];
+let lastPayload = '';
+
+async function getJSON(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(url + ' -> HTTP ' + res.status);
+  return res.json();
+}
+
+function node(root, key) { return root.querySelector('[data-' + key + ']'); }
+
+function setStat(parent, label, value) {
+  const s = document.createElement('span');
+  s.textContent = label + ' ';
+  const b = document.createElement('b');
+  b.textContent = value;
+  s.appendChild(b);
+  parent.appendChild(s);
+}
+
+function uptime(sec) {
+  if (!sec || sec <= 0) return '-';
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : m + 'm';
+}
+
+function ageSeconds(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, (Date.now() - t) / 1000);
+}
+
+// Thresholds match the TUI's pctCell styling (styles.go).
+function fillBar(bar, pct) {
+  bar.style.width = Math.min(100, Math.max(0, pct)) + '%';
+  if (pct >= 90) bar.className = 'hot';
+  else if (pct >= 75) bar.className = 'warm';
+}
+
+function pctCell(td, pct, text) {
+  if (pct === null || pct === undefined) {
+    td.textContent = text;
+    return;
+  }
+  const bar = document.createElement('i');
+  fillBar(bar, pct);
+  const shell = document.createElement('span');
+  shell.className = 'bar sm';
+  shell.appendChild(bar);
+  td.textContent = text;
+  td.insertBefore(shell, td.firstChild);
+}
+
+function renderSession(s) {
+  const el = document.getElementById('tpl-session').content.cloneNode(true);
+  node(el, 'name').textContent = s.name || s.id;
+  node(el, 'target').textContent = s.target;
+
+  const conn = node(el, 'conn');
+  conn.textContent = s.connected ? 'connected' : 'down';
+  conn.className = 'badge ' + (s.connected ? 'ok' : 'bad');
+
+  const ageEl = node(el, 'age');
+  ageRefs.push({ el: ageEl, iso: s.fetchedAt });
+
+  const stats = node(el, 'stats');
+  if (s.hasHostStats && s.hostStats) {
+    const h = s.hostStats;
+    setStat(stats, 'load', [h.load1, h.load5, h.load15].map(v => (v ?? 0).toFixed(2)).join(' '));
+    setStat(stats, 'cpu', String(h.numCPU || '?'));
+    const used = h.memUsedMB || 0, total = h.memTotalMB || 0;
+    const pct = total > 0 ? used * 100 / total : 0;
+    const mem = document.createElement('span');
+    mem.textContent = 'mem ';
+    const bar = document.createElement('i');
+    fillBar(bar, pct);
+    const shell = document.createElement('span');
+    shell.className = 'bar';
+    shell.appendChild(bar);
+    const val = document.createElement('b');
+    val.textContent = Math.round(pct) + '% (' + used + '/' + total + ' MB)';
+    mem.appendChild(shell);
+    mem.appendChild(document.createTextNode(' '));
+    mem.appendChild(val);
+    stats.appendChild(mem);
+    setStat(stats, 'uptime', uptime(h.uptimeSec));
+  } else {
+    setStat(stats, 'host stats', 'not fetched yet');
+  }
+
+  const rows = node(el, 'rows');
+  const containers = s.containers || [];
+  if (!containers.length) {
+    const td = document.createElement('td');
+    td.colSpan = 7;
+    td.className = 'empty';
+    td.textContent = 'no containers reported';
+    const tr = document.createElement('tr');
+    tr.appendChild(td);
+    rows.appendChild(tr);
+  }
+  for (const c of containers) {
+    const tr = document.getElementById('tpl-row').content.cloneNode(true);
+    node(tr, 'name').textContent = c.name || c.id.slice(0, 12);
+    node(tr, 'image').textContent = c.image;
+    const st = node(tr, 'state');
+    st.textContent = c.state;
+    st.className = c.state === 'running' ? 'state-running'
+      : c.state === 'exited' ? 'state-exited' : 'state-other';
+    node(tr, 'status').textContent = c.status;
+    pctCell(node(tr, 'cpu'), c.cpuPct, c.cpu);
+    pctCell(node(tr, 'mem'), c.memPct, c.memPerc);
+    node(tr, 'usage').textContent = c.memUsage;
+    rows.appendChild(tr);
+  }
+  return el;
+}
+
+// --- Network tab: bipartite container/network graph ------------------------
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const NAME_MAX = 14; // 11px mono glyphs are ~6.7px wide; 14 keeps ring labels apart
+const CHORD = 96;    // minimum arc spacing between two nodes on a ring
+
+function trunc(name) {
+  return name.length > NAME_MAX ? name.slice(0, NAME_MAX - 1) + '…' : name;
+}
+
+function svgEl(tag, attrs, cls) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const key in attrs) el.setAttribute(key, String(attrs[key]));
+  if (cls) el.setAttribute('class', cls);
+  return el;
+}
+
+// textEl attaches a <title> only when the label was shortened, so the full
+// remote name stays readable on hover. Nothing here ever touches innerHTML.
+function textEl(x, y, shown, full, cls, anchor) {
+  const t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle' }, cls);
+  t.setAttribute('dominant-baseline', 'middle');
+  t.textContent = shown;
+  if (shown !== full) {
+    const tip = document.createElementNS(SVG_NS, 'title');
+    tip.textContent = full;
+    t.appendChild(tip);
+  }
+  return t;
+}
+
+function ringRadius(count) {
+  if (count <= 1) return 74;
+  if (count === 2) return 88;
+  return Math.max(98, Math.ceil(CHORD / (2 * Math.sin(Math.PI / count))));
+}
+
+function plural(n, word) {
+  return n + ' ' + word + (n === 1 ? '' : 's');
+}
+
+// buildGraph draws clusters on a deterministic grid: networks are placed in
+// name order, their members on a circle around them, and a container that
+// joins several networks anchors at its first one and lines across to the rest.
+function buildGraph(g) {
+  const nodes = g.nodes || [], edges = g.edges || [], iso = g.isolated || [];
+  const nets = nodes.filter(n => n.kind === 'network');
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const members = new Map(); // network id → container ids
+  for (const e of edges) {
+    if (!byId.has(e.from) || !byId.has(e.to)) continue;
+    let arr = members.get(e.to);
+    if (!arr) { arr = []; members.set(e.to, arr); }
+    arr.push(e.from);
+  }
+  const anchor = new Map(), ring = new Map(); // container → network, network → ring slots
+  for (const n of nets) ring.set(n.id, []);
+  for (const n of nets) {
+    for (const id of members.get(n.id) || []) {
+      if (anchor.has(id)) continue;
+      anchor.set(id, n.id);
+      ring.get(n.id).push(id);
+    }
+  }
+
+  const radii = nets.map(n => ringRadius(ring.get(n.id).length));
+  const maxR = radii.length ? Math.max.apply(null, radii) : 0;
+  const cellW = 2 * (maxR + 62), cellH = 2 * (maxR + 44);
+  const cols = nets.length ? Math.ceil(Math.sqrt(nets.length)) : 0;
+  const rows = nets.length ? Math.ceil(nets.length / cols) : 0;
+  const pad = 24, gridW = cols * cellW, gridH = rows * cellH;
+
+  const pos = new Map(); // node id → {x, y}
+  nets.forEach((n, i) => {
+    pos.set(n.id, {
+      x: pad + (i % cols) * cellW + cellW / 2,
+      y: pad + Math.floor(i / cols) * cellH + cellH / 2
+    });
+  });
+  for (const n of nets) {
+    const c = pos.get(n.id), ids = ring.get(n.id), R = ringRadius(ids.length);
+    ids.forEach((id, i) => {
+      const a = -Math.PI / 2 + i * 2 * Math.PI / ids.length;
+      pos.set(id, { x: c.x + R * Math.cos(a), y: c.y + R * Math.sin(a) });
+    });
+  }
+
+  const isoCols = Math.max(1, Math.floor(Math.max(gridW, 336) / 168));
+  const isoRows = Math.ceil(iso.length / isoCols);
+  const gap = nets.length && iso.length ? 26 : 0;
+  const stripTop = pad + gridH + gap;
+  const W = pad * 2 + Math.max(gridW, iso.length ? isoCols * 168 : 0);
+  const H = pad * 2 + gridH + gap + (iso.length ? 30 + isoRows * 26 : 0);
+
+  const svg = svgEl('svg', { width: Math.ceil(W), height: Math.ceil(H) });
+  for (const e of edges) {
+    const a = pos.get(e.from), b = pos.get(e.to);
+    if (!a || !b) continue;
+    svg.appendChild(svgEl('line', { x1: a.x, y1: a.y, x2: b.x, y2: b.y }, 'edge'));
+  }
+  for (const n of nets) {
+    const p = pos.get(n.id);
+    const w = Math.min(170, trunc(n.name).length * 6.7 + 18);
+    svg.appendChild(svgEl('rect', { x: p.x - w / 2, y: p.y - 10, width: w, height: 20, rx: 3 }, 'net-box'));
+    svg.appendChild(textEl(p.x, p.y, trunc(n.name), n.name, 'net-label'));
+  }
+  for (const [id, p] of pos) {
+    const n = byId.get(id);
+    if (!n || n.kind !== 'container') continue;
+    svg.appendChild(svgEl('circle', { cx: p.x, cy: p.y, r: 4 }, n.state === 'running' ? 'dot ok' : 'dot bad'));
+    svg.appendChild(textEl(p.x, p.y + 16, trunc(n.name), n.name, 'ctr-label'));
+  }
+  if (iso.length) {
+    svg.appendChild(textEl(pad, stripTop + 10, 'no user-defined network', 'no user-defined network', 'strip-label', 'start'));
+    iso.forEach((n, i) => {
+      const x = pad + (i % isoCols) * 168, y = stripTop + 34 + Math.floor(i / isoCols) * 26;
+      svg.appendChild(svgEl('circle', { cx: x + 4, cy: y, r: 4 }, n.state === 'running' ? 'dot ok' : 'dot bad'));
+      svg.appendChild(textEl(x + 14, y, trunc(n.name), n.name, 'ctr-label', 'start'));
+    });
+  }
+
+  const linked = anchor.size;
+  let note = nets.length
+    ? plural(nets.length, 'network') + ' · ' + plural(linked, 'container') + ' linked'
+    : 'no user-defined networks';
+  if (iso.length) note += ' · ' + plural(iso.length, 'container') + ' without one';
+  if (g.truncated) note += ' · showing the first ' + nodes.length + ' nodes';
+  return { svg: nets.length || iso.length ? svg : null, note: note };
+}
+
+function renderNetwork(summary, g) {
+  const el = document.getElementById('tpl-graph').content.cloneNode(true);
+  node(el, 'name').textContent = summary.name || summary.id;
+  node(el, 'target').textContent = summary.target;
+  const conn = node(el, 'conn');
+  conn.textContent = summary.connected ? 'connected' : 'down';
+  conn.className = 'badge ' + (summary.connected ? 'ok' : 'bad');
+  const body = node(el, 'graph');
+  if (!g.available) {
+    const p = document.createElement('p');
+    p.className = 'empty';
+    p.textContent = 'containers not fetched yet';
+    body.appendChild(p);
+    return el;
+  }
+  ageRefs.push({ el: node(el, 'age'), iso: g.fetchedAt });
+
+  const built = buildGraph(g);
+  const note = document.createElement('p');
+  note.className = 'note';
+  note.textContent = built.note;
+  body.appendChild(note);
+  if (built.svg) {
+    const wrap = document.createElement('div');
+    wrap.className = 'graph';
+    wrap.appendChild(built.svg);
+    body.appendChild(wrap);
+  }
+  return el;
+}
+
+function setStatus(text, bad) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = bad ? 'bad' : '';
+}
+
+// renderAges rewrites only the age labels, so they count smoothly between
+// polls instead of jumping when the panels are rebuilt.
+function renderAges() {
+  for (const { el, iso } of ageRefs) {
+    const age = ageSeconds(iso);
+    if (age === null) {
+      el.textContent = '';
+      continue;
+    }
+    el.textContent = age < 5 ? 'updated just now' : 'updated ' + Math.round(age) + 's ago';
+    el.className = 'age' + (age > STALE_AFTER_S ? ' stale' : '');
+  }
+}
+
+function emptyPanel(text) {
+  const p = document.createElement('p');
+  p.className = 'panel empty';
+  p.textContent = text;
+  return p;
+}
+
+function rebuild(panels) {
+  document.getElementById(tab).replaceChildren(...panels);
+  renderAges();
+}
+
+const NO_SESSIONS = 'Connect a host in the vpstui TUI to publish its data here.';
+
+async function tickSessions(list) {
+  const details = await Promise.all(
+    list.map(s => getJSON('/api/sessions/' + encodeURIComponent(s.id)).catch(() => null))
+  );
+  const payload = JSON.stringify(details);
+  // Skip the repaint entirely when nothing changed; a full rebuild is what
+  // makes the page flicker and clears any selected text.
+  if (payload !== lastPayload) {
+    lastPayload = payload;
+    ageRefs = [];
+    rebuild(details.filter(Boolean).map(renderSession));
+  } else {
+    renderAges();
+  }
+  const shown = details.filter(Boolean).length;
+  const containers = details.reduce((n, d) => n + ((d && d.containers) ? d.containers.length : 0), 0);
+  setStatus('live · ' + plural(shown, 'session') + ' · ' + plural(containers, 'container'), false);
+}
+
+async function tickNetwork(list) {
+  const graphs = await Promise.all(
+    list.map(s => getJSON('/api/sessions/' + encodeURIComponent(s.id) + '/network').catch(() => null))
+  );
+  const pairs = [];
+  list.forEach((s, i) => { if (graphs[i]) pairs.push([s, graphs[i]]); });
+  const payload = JSON.stringify(pairs);
+  if (payload !== lastPayload) {
+    lastPayload = payload;
+    ageRefs = [];
+    rebuild(pairs.map(([s, g]) => renderNetwork(s, g)));
+  } else {
+    renderAges();
+  }
+  const nets = pairs.reduce((n, [, g]) => n + (g.nodes || []).filter(x => x.kind === 'network').length, 0);
+  setStatus('live · ' + plural(pairs.length, 'session') + ' · ' + plural(nets, 'network'), false);
+}
+
+async function tick() {
+  if (busy) return; // never overlap a slow poll with the next one
+  busy = true;
+  try {
+    let list;
+    try {
+      list = await getJSON('/api/sessions');
+    } catch (err) {
+      setStatus('api unreachable — is vpstui running? (' + err.message + ')', true);
+      return;
+    }
+    if (!list.length) {
+      if (lastPayload !== '[]') {
+        lastPayload = '[]';
+        ageRefs = [];
+        rebuild([emptyPanel(NO_SESSIONS)]);
+      }
+      setStatus('live · no connected sessions', false);
+      return;
+    }
+    if (tab === 'network') await tickNetwork(list); else await tickSessions(list);
+  } finally {
+    busy = false;
+  }
+}
+
+function applyRate(ms) {
+  pollMs = ms;
+  localStorage.setItem('vpstui.rate', String(ms));
+  clearInterval(pollTimer);
+  pollTimer = setInterval(tick, pollMs);
+}
+
+function paintTab() {
+  document.getElementById('sessions').hidden = tab !== 'sessions';
+  document.getElementById('network').hidden = tab !== 'network';
+  for (const b of document.querySelectorAll('#tabs button')) {
+    b.className = b.dataset.tab === tab ? 'active' : '';
+  }
+}
+
+// The two tabs render different payloads, so switching drops the cached one
+// rather than comparing against the other view.
+function switchTab(next) {
+  tab = next;
+  localStorage.setItem('vpstui.tab', next);
+  lastPayload = '';
+  ageRefs = [];
+  paintTab();
+  tick();
+}
+
+const rateSel = document.getElementById('rate');
+for (const ms of RATES) {
+  const opt = document.createElement('option');
+  opt.value = String(ms);
+  opt.textContent = ms / 1000 + 's';
+  rateSel.appendChild(opt);
+}
+rateSel.value = String(pollMs);
+rateSel.addEventListener('change', () => applyRate(Number(rateSel.value)));
+for (const b of document.querySelectorAll('#tabs button')) {
+  b.addEventListener('click', () => switchTab(b.dataset.tab));
+}
+
+setInterval(renderAges, 1000);
+paintTab();
+applyRate(pollMs);
+tick();
+</script>
+</body>
+</html>

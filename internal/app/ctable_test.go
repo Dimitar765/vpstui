@@ -195,14 +195,14 @@ func TestCTableVimKeys(t *testing.T) {
 }
 
 func TestLogsViewTopBottom(t *testing.T) {
-	c := NewContainerView("abcdef0123456789", "web", 80, 30)
-	for i := 0; i < 100; i++ {
-		c.Append("line\n")
+	c := newLogView()
+	feed(c, "l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10")
+	c.flush()
+	// The fixture must overflow the viewport, or g/G pass by scrolling nothing.
+	if c.vp.AtTop() && c.vp.AtBottom() {
+		t.Fatal("viewport cannot scroll: the rows never exceeded its height")
 	}
-	c.running = false // stop auto-follow so we can scroll
-	key := func(r string) tea.KeyMsg {
-		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r)}
-	}
+
 	c, _ = c.Update(key("g"))
 	if !c.vp.AtTop() {
 		t.Fatal("g should scroll logs to top")

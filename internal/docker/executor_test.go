@@ -330,6 +330,52 @@ func TestParseDFMalformed(t *testing.T) {
 	}
 }
 
+func TestParsePs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []models.Container
+	}{
+		{
+			// docker ps reports the 12-char short id; that is the app's
+			// canonical container id, so the graph joins on it unchanged.
+			name: "short id kept, networks split and sorted",
+			in:   `{"Id":"8f30766c1db2","Names":"odysseus-odysseus-1","Image":"odysseus","State":"running","Status":"Up 3 hours","Networks":"v2_default,airport_default,backend_default"}`,
+			want: []models.Container{{ID: "8f30766c1db2", Names: "odysseus-odysseus-1", Image: "odysseus",
+				State: "running", Status: "Up 3 hours",
+				Networks: []string{"airport_default", "backend_default", "v2_default"}}},
+		},
+		{
+			name: "default networks kept here",
+			in:   `{"Id":"36f80c5ea5bd","Names":"teamcity-server","State":"running","Networks":"bridge"}`,
+			want: []models.Container{{ID: "36f80c5ea5bd", Names: "teamcity-server", State: "running",
+				Networks: []string{"bridge"}}},
+		},
+		{
+			name: "absent or empty networks stay nil",
+			in:   "{\"Id\":\"aaa111222333\",\"Names\":\"x\"}\n{\"Id\":\"bbb111222333\",\"Names\":\"y\",\"Networks\":\"\"}\n",
+			want: []models.Container{{ID: "aaa111222333", Names: "x"}, {ID: "bbb111222333", Names: "y"}},
+		},
+		{
+			name: "blank and garbage lines skipped",
+			in:   "\nnot json\n" + `{"Id":"ccc111222333","Names":"z","Networks":"net_a"}` + "\n",
+			want: []models.Container{{ID: "ccc111222333", Names: "z", Networks: []string{"net_a"}}},
+		},
+		{
+			name: "empty output",
+			in:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePs(tt.in)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parsePs() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestShellCommand(t *testing.T) {
 	tests := []struct {
 		name string

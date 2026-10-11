@@ -64,6 +64,7 @@ type psJSON struct {
 	Status    string `json:"Status"`
 	CreatedAt string `json:"CreatedAt"`
 	Labels    string `json:"Labels"`
+	Networks  string `json:"Networks"`
 }
 
 func (e *Executor) ListContainers(ctx context.Context) ([]models.Container, error) {
@@ -71,6 +72,14 @@ func (e *Executor) ListContainers(ctx context.Context) ([]models.Container, erro
 	if err != nil {
 		return nil, err
 	}
+	return parsePs(out), nil
+}
+
+// parsePs parses the NDJSON produced by `docker ps -a --format '{{json .}}'`.
+// Extracted from ListContainers to make it testable. Its IDs are docker's
+// 12-char short form, which is the app's canonical container id everywhere:
+// the table, action args, and graph node ids.
+func parsePs(out string) []models.Container {
 	var res []models.Container
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
@@ -81,13 +90,18 @@ func (e *Executor) ListContainers(ctx context.Context) ([]models.Container, erro
 		if err := json.Unmarshal([]byte(line), &j); err != nil {
 			continue
 		}
-		res = append(res, models.Container{
+		c := models.Container{
 			ID: j.ID, Names: j.Names, Image: j.Image,
 			State: j.State, Status: j.Status, CreatedAt: j.CreatedAt,
 			Labels: j.Labels,
-		})
+		}
+		if j.Networks != "" {
+			c.Networks = strings.Split(j.Networks, ",")
+			sort.Strings(c.Networks)
+		}
+		res = append(res, c)
 	}
-	return res, nil
+	return res
 }
 
 type statsJSON struct {
@@ -236,8 +250,8 @@ func (e *Executor) Rm(ctx context.Context, id string) error {
 	return err
 }
 
-func (e *Executor) StreamLogs(ctx context.Context, id string) (io.ReadCloser, error) {
-	return e.conn.StreamExec(ctx, "docker logs -f --tail 200 "+quote(id))
+func (e *Executor) StreamLogs(ctx context.Context, id string, tail int) (io.ReadCloser, error) {
+	return e.conn.StreamExec(ctx, "docker logs -f --timestamps --tail "+strconv.Itoa(tail)+" "+quote(id))
 }
 
 // ShellCommand builds the SSH-level command for an interactive container
