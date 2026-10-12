@@ -454,6 +454,11 @@ func (d *Dashboard) perfSection(now time.Time) *httpapi.PerfSection {
 			MemPeakBytes: r.Sum.MemPeak,
 			Series:       perf.Points(d.perf.Series(now, r.ID, perf.Window), perf.MaxPoints),
 		}
+		// The label comes from the same store the TUI ranking cell reads, so the
+		// page and the terminal cannot disagree about a container's name.
+		if tag, ok := d.tags.Get(d.host.ID, r.Name); ok {
+			p.Tag, p.TagColor = tag.Tag, tag.Color
+		}
 		if peak, ok := d.peaks[r.ID]; ok {
 			if v := peak.MemPeakBytes; v != models.Unknown {
 				p.AllTimeMemPeakBytes = &v

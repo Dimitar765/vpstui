@@ -793,7 +793,18 @@ function renderPerf(s) {
     const tr = document.getElementById('tpl-perf-row').content.cloneNode(true);
     node(tr, 'rank').textContent = String(i + 1);
     const nameTd = node(tr, 'name');
-    nameTd.textContent = r.name || r.id;
+    // Label first, docker name behind it in the dim colour — the same order and
+    // the same two strings the sessions table cell holds, so all three surfaces
+    // (TUI ranking, sessions tab, perf tab) name a container identically.
+    if (r.tag) {
+      nameTd.appendChild(tagChip(r.tag, r.tagColor));
+      const dn = document.createElement('span');
+      dn.className = 'docker';
+      dn.textContent = r.name || r.id;
+      nameTd.appendChild(dn);
+    } else {
+      nameTd.textContent = r.name || r.id;
+    }
     nameTd.title = r.id; // the join key, readable on hover, never guessed
     node(tr, 'cpu').textContent = fmtPct(r.cpu);
     node(tr, 'avg').textContent = fmtPct(r.cpuAvg);

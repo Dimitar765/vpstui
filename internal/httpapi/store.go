@@ -41,15 +41,17 @@ type ErrorSnapshot struct {
 // are already ranked, flagged and downsampled, so the page draws this list in the
 // order it arrives and computes nothing.
 type PerfSnapshot struct {
-	ID      string
-	Name    string
-	CPU     float64 // newest reading
-	CPUAvg  float64
-	CPUPeak float64
-	Share   float64 // percent of the box, whichever side dominates, 0..100
-	Spike   float64 // newest / mean
-	Flags   []string
-	Samples int
+	ID       string
+	Name     string
+	Tag      string  // the user's own label, "" when unlabelled
+	TagColor string  // palette name, see app.tagColors
+	CPU      float64 // newest reading
+	CPUAvg   float64
+	CPUPeak  float64
+	Share    float64 // percent of the box, whichever side dominates, 0..100
+	Spike    float64 // newest / mean
+	Flags    []string
+	Samples  int
 
 	MemBytes     int64
 	MemPeakBytes int64

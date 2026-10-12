@@ -652,8 +652,13 @@ func TestSessionEndpointPerfContract(t *testing.T) {
 	if probed["id"] != "bbb222222222" {
 		t.Errorf("rank 1 = %v, want the hog: the terminal's order must survive the wire", probed["id"])
 	}
-	if len(probed) != 17 {
-		t.Errorf("probed row has %d keys, want 17: %v", len(probed), probed)
+	// 19: the probed counters plus the tag pair — tag/tagColor ride with the
+	// row so the perf tab names containers like the sessions tab does.
+	if len(probed) != 19 {
+		t.Errorf("probed row has %d keys, want 19: %v", len(probed), probed)
+	}
+	if probed["tag"] != "mail" || probed["tagColor"] != "sky" {
+		t.Errorf("probed row tag = %v/%v, want mail/sky", probed["tag"], probed["tagColor"])
 	}
 	if len(rows[1].(map[string]any)) != 12 {
 		t.Errorf("unprobed row has %d keys, want 12 (no all-time claims): %v",

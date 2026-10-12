@@ -59,14 +59,16 @@ type sessionJSON struct {
 // terminal ranks them, so the page never sorts or thresholds anything: a hog on
 // the screen is a hog here.
 type perfRowJSON struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	CPU     float64  `json:"cpu"`
-	CPUAvg  float64  `json:"cpuAvg"`
-	CPUPeak float64  `json:"cpuPeak"`
-	Share   float64  `json:"share"` // percent of the box, as the terminal prints it
-	Spike   float64  `json:"spike"`
-	Flags   []string `json:"flags"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Tag      string   `json:"tag,omitempty"`
+	TagColor string   `json:"tagColor,omitempty"`
+	CPU      float64  `json:"cpu"`
+	CPUAvg   float64  `json:"cpuAvg"`
+	CPUPeak  float64  `json:"cpuPeak"`
+	Share    float64  `json:"share"` // percent of the box, as the terminal prints it
+	Spike    float64  `json:"spike"`
+	Flags    []string `json:"flags"`
 
 	Samples      int   `json:"samples"`
 	MemBytes     int64 `json:"memBytes"`
@@ -110,7 +112,8 @@ func toPerfJSON(p *PerfSection) *perfJSON {
 	}
 	for _, r := range p.Rows {
 		row := perfRowJSON{
-			ID: r.ID, Name: r.Name, CPU: r.CPU, CPUAvg: r.CPUAvg, CPUPeak: r.CPUPeak,
+			ID: r.ID, Name: r.Name, Tag: r.Tag, TagColor: r.TagColor,
+			CPU: r.CPU, CPUAvg: r.CPUAvg, CPUPeak: r.CPUPeak,
 			Share: r.Share, Spike: r.Spike, Flags: r.Flags,
 			Samples: r.Samples, MemBytes: r.MemBytes, MemPeakBytes: r.MemPeakBytes,
 			AllTimeMemPeakBytes: r.AllTimeMemPeakBytes,

@@ -452,6 +452,17 @@ func TestPerfSnapshotCarriesTheWindow(t *testing.T) {
 	if !reflect.DeepEqual(sec.Rows[0].Flags, d.perfRanks[0].Flags) {
 		t.Errorf("flags diverged from the badges on screen: %v vs %v", sec.Rows[0].Flags, d.perfRanks[0].Flags)
 	}
+	// The label rides with the row from the same store the ranking cell reads,
+	// so the page's perf tab names containers exactly like the terminal does.
+	d.tags.Set(d.hostID, "hog", "mail", "sky", "bbb222222222")
+	if tagged := d.snapshot(host("h"), true).Perf.Rows[0]; tagged.Tag != "mail" || tagged.TagColor != "sky" {
+		t.Errorf("tagged row published %q/%q, want mail/sky", tagged.Tag, tagged.TagColor)
+	}
+	// Clearing the label clears it on the wire too (a nil store must not panic).
+	d.tags.Clear(d.hostID, "hog")
+	if untagged := d.snapshot(host("h"), true).Perf.Rows[0]; untagged.Tag != "" || untagged.TagColor != "" {
+		t.Errorf("untagged row published %q/%q", untagged.Tag, untagged.TagColor)
+	}
 	if sec.Rows[0].AllTimeMemPeakBytes == nil || *sec.Rows[0].AllTimeMemPeakBytes != 115343360 {
 		t.Errorf("all-time peak not published: %+v", sec.Rows[0])
 	}

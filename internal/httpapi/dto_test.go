@@ -181,7 +181,8 @@ func perfFixture() SessionSnapshot {
 			Supported: true,
 			Rows: []PerfSnapshot{
 				{
-					ID: "bbb222222222", Name: "hog", CPU: 42, CPUAvg: 3.8, CPUPeak: 61.2,
+					ID: "bbb222222222", Name: "hog", Tag: "mail", TagColor: "sky",
+					CPU: 42, CPUAvg: 3.8, CPUPeak: 61.2,
 					// 42% of one core on a 12-core box is 3.5% of the box: share is a
 					// percentage, printed exactly as the terminal prints it.
 					Share: 3.5, Spike: 11.1, Flags: []string{"hog", "spike"}, Samples: 310,
@@ -249,6 +250,14 @@ func TestToPerfJSONMapsWindow(t *testing.T) {
 	}
 	if got.Rows[0].CPUAvgCores == nil || *got.Rows[0].CPUAvgCores != 0.26 {
 		t.Errorf("the cumulative-seconds rate was dropped: %+v", got.Rows[0])
+	}
+	// The label rides with the row: the perf tab names a container exactly like
+	// the sessions tab, without joining tables in JS.
+	if got.Rows[0].Tag != "mail" || got.Rows[0].TagColor != "sky" {
+		t.Errorf("tag = %q/%q, want mail/sky", got.Rows[0].Tag, got.Rows[0].TagColor)
+	}
+	if got.Rows[1].Tag != "" || got.Rows[1].TagColor != "" {
+		t.Errorf("untagged row grew a tag: %+v", got.Rows[1])
 	}
 	if got.Rows[1].AllTimeMemPeakBytes != nil || got.Rows[1].CPUSeconds != nil ||
 		got.Rows[1].CPUAvgCores != nil ||
