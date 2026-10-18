@@ -7,6 +7,27 @@ transport into deployments, domains with automatic TLS, managed databases,
 one-click templates, webhooks, notifications and alert rules, with an
 embedded web GUI and a hub mode in the TUI.
 
+## Install
+
+On any systemd Linux VPS (amd64/arm64), as root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dimitar765/vpstui/main/scripts/install.sh | bash
+```
+
+Installs `vpstui-server` from GitHub Releases, bootstraps an admin account,
+prepares docker for hosting deployments, and registers the machine as the
+first managed server. The daemon binds `127.0.0.1:8713` only — reach the web
+GUI through an SSH tunnel from your own machine:
+
+```sh
+ssh -N -L 8713:127.0.0.1:8713 root@<vps-ip>
+# then open http://127.0.0.1:8713/
+```
+
+Re-running the script upgrades in place. Flags and details:
+[Install on a VPS](#install-on-a-vps).
+
 ## Features
 
 - **Host manager** — add/edit/delete VPS entries, persisted to
