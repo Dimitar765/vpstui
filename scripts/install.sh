@@ -485,11 +485,13 @@ print_summary() {
   fi
   [[ -n ${host_ip:-} ]] || host_ip="<vps-ip>"
 
-  local reg_line key_line mode_line
+  local reg_line key_line mode_line pw_line
   if (( CONFIGURED )); then
     mode_line="upgrade in place (existing data/admin/servers untouched)"
+    pw_line="<unchanged from the original install — bootstrap was skipped>"
   else
     mode_line="fresh install"
+    pw_line="${ADMIN_PASSWORD}  (change it under Settings after first login)"
   fi
   case "$REGISTERED" in
     yes)     reg_line="managed server registered + connectivity test passed" ;;
@@ -515,9 +517,7 @@ print_summary() {
      ssh -N -L ${PORT}:127.0.0.1:${PORT} root@${host_ip}
      then open http://127.0.0.1:${PORT}/ in your browser
  Admin:     ${ADMIN_EMAIL}
- Password:  ${ADMIN_PASSWORD}
-            (generated this run if you did not pass --admin-password;
-             change it under Settings after first login)
+ Password:  ${pw_line}
  API key:   ${key_line}
             (shown once; use it as 'Authorization: Bearer ...')
  Docker:    $( (( WITH_DOCKER )) && echo "prepared for hosting deployments" || echo "skipped (--no-docker)" )
