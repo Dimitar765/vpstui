@@ -235,12 +235,22 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
   mv "$tmp" /etc/systemd/system/vpstui-server.service
+  # mv from /tmp keeps the tmp context on SELinux-enforcing systems; the
+  # confined systemd manager then cannot read the unit and reports it as
+  # missing. restorecon relabels from the parent dir default; absent
+  # (non-SELinux distros) → skip.
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon /etc/systemd/system/vpstui-server.service
+  fi
   log "unit written: /etc/systemd/system/vpstui-server.service"
 }
 
 activate() {
   systemctl daemon-reload
-  systemctl enable --now vpstui-server
+  if ! systemctl enable --now vpstui-server; then
+    warn "if SELinux is enforcing, run: restorecon -v /etc/systemd/system/vpstui-server.service && systemctl daemon-reload && systemctl enable --now vpstui-server"
+    die "could not enable vpstui-server"
+  fi
   log "vpstui-server enabled and started"
 }
 
