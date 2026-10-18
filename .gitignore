@@ -1,2 +1,60 @@
+# --- Go build artifacts ---
 /vpstui
+/vpstui-server
+/cmd/vpstui-server/vpstui-server
+*.test
+*.out
+*.prof
+*.pprof
+
+# --- Local runtime data (never commit state, tokens or secrets) ---
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+secrets.json
+secrets*.json
+setup-token*
+hosts.json
+tags.json
+settings.json
+*.log
+
+# --- Web GUI (Next.js static export; sources in web/, build output embedded via webout/.keep) ---
+web/node_modules/
+web/.next/
+web/out/
+web/*.tsbuildinfo
+web/.eslintcache
+web/next-env.d.ts
+web/.vercel
+internal/server/webout/*
+!internal/server/webout/.keep
+
+# --- Node / package managers (any depth) ---
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Environment & credentials ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Editor / IDE / tooling ---
 /.qoder/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.history/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini

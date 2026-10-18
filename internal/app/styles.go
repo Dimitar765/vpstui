@@ -8,6 +8,67 @@ import (
 	"vpstui/internal/perf"
 )
 
+// palette is the named colour set every style var is built from. The dark
+// palette is byte-for-byte what the TUI rendered before theming existed, so
+// switching palettes is the only way the frame can change.
+type colorSet struct {
+	title, err, ok, warn, muted, key, banner      string
+	tableHeader, tableSelectedBg, tableSelectedFg string
+	composeHeader, auth                           string
+	activeTabBg, activeTabFg, border              string
+}
+
+// curPalette is the palette the style vars were last built from; anything that
+// cannot be a plain var (the active tab's two colours) reads it directly.
+var curPalette = colorSets["dark"]
+
+var colorSets = map[string]colorSet{"dark": {
+	title: "99", err: "196", ok: "42", warn: "214", muted: "241",
+	key: "231", banner: "220",
+	tableHeader: "241", tableSelectedBg: "236", tableSelectedFg: "231",
+	composeHeader: "147", auth: "110",
+	activeTabBg: "236", activeTabFg: "231", border: "240",
+},
+	"light": {
+		title: "61", err: "124", ok: "22", warn: "130", muted: "245",
+		key: "0", banner: "94",
+		tableHeader: "245", tableSelectedBg: "253", tableSelectedFg: "0",
+		composeHeader: "61", auth: "24",
+		activeTabBg: "253", activeTabFg: "0", border: "250",
+	},
+	"high-contrast": {
+		title: "141", err: "203", ok: "48", warn: "220", muted: "250",
+		key: "231", banner: "226",
+		tableHeader: "231", tableSelectedBg: "231", tableSelectedFg: "0",
+		composeHeader: "159", auth: "153",
+		activeTabBg: "231", activeTabFg: "0", border: "249",
+	},
+}
+
+// applyTheme rebuilds every style var from the named palette. An unknown name
+// keeps the current (dark) styles — a typo in settings.json cannot blank the UI.
+func applyTheme(theme string) {
+	p, ok := colorSets[theme]
+	if !ok {
+		return
+	}
+	curPalette = p
+	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(p.title))
+	styleErr = lipgloss.NewStyle().Foreground(lipgloss.Color(p.err))
+	styleOK = lipgloss.NewStyle().Foreground(lipgloss.Color(p.ok))
+	styleWarn = lipgloss.NewStyle().Foreground(lipgloss.Color(p.warn))
+	styleMuted = lipgloss.NewStyle().Foreground(lipgloss.Color(p.muted))
+	styleKey = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(p.key))
+	styleBanner = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(p.banner))
+
+	styleTableHeader = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(p.tableHeader))
+	styleTableSelected = lipgloss.NewStyle().Bold(true).
+		Background(lipgloss.Color(p.tableSelectedBg)).Foreground(lipgloss.Color(p.tableSelectedFg))
+	styleComposeHeader = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(p.composeHeader))
+	styleAuth = lipgloss.NewStyle().Foreground(lipgloss.Color(p.auth))
+	styleBorder = lipgloss.Color(p.border)
+}
+
 var (
 	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("99"))
 	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
@@ -21,7 +82,11 @@ var (
 	styleTableSelected = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("236")).Foreground(lipgloss.Color("231"))
 	styleComposeHeader = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("147"))
 	styleAuth          = lipgloss.NewStyle().Foreground(lipgloss.Color("110"))
+
+	styleBorder lipgloss.Color
 )
+
+func init() { applyTheme("dark") }
 
 // stateCell renders a container state with a colored status dot. The result
 // stays within ctable's State column width for all docker states.
@@ -87,7 +152,10 @@ func flagCell(s string) string {
 }
 
 func lipglossActiveTab() lipgloss.Style {
-	return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("236")).Foreground(lipgloss.Color("231")).Padding(0, 1)
+	return lipgloss.NewStyle().Bold(true).
+		Background(lipgloss.Color(curPalette.activeTabBg)).
+		Foreground(lipgloss.Color(curPalette.activeTabFg)).
+		Padding(0, 1)
 }
 
 func helpLine(pairs ...string) string {
@@ -106,7 +174,7 @@ func panel(title, content string, width int) string {
 	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("240")).
+		BorderForeground(styleBorder).
 		Padding(0, 1).
 		// lipgloss Width excludes border and padding; shrink so the outer
 		// frame lands exactly at the requested width.

@@ -63,8 +63,8 @@ func TestDashboardPinsFooter(t *testing.T) {
 		t.Errorf("dashboard height = %d, want 30 (pinned frame)", h)
 	}
 	last := strings.Split(v, "\n")[h(v)-1]
-	if !strings.Contains(last, "esc") || !strings.Contains(last, "back") {
-		t.Errorf("footer not on last row: %q", last)
+	if !strings.Contains(last, "more") {
+		t.Errorf("footer (top-5 + ? more) not on last row: %q", last)
 	}
 	// disk panel pins its footer too
 	d.showDisk = true

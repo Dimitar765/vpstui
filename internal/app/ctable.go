@@ -18,9 +18,14 @@ const (
 	// cellTag is the container name cell: the text already carries the user's
 	// label and the docker name, and the row's tag colour goes on after fitting.
 	cellTag
-	// cellFlag is the perf badge cell, which colours each word of the pair on its
-	// own — a column kind cannot do that for one shared cell.
+	// cellFlag is the perf badge cell, which colours each word of the pair on
+	// its own — a column kind cannot do that for one shared cell.
 	cellFlag
+	// cellHubStatus styles a hub server/app/deployment status string after
+	// fitting, exactly like cellState does for docker states.
+	cellHubStatus
+	// cellAlert styles the fleet view's firing-alert badge.
+	cellAlert
 )
 
 type ctableCol struct {
@@ -147,7 +152,29 @@ func (t ctable) Update(msg tea.Msg) (ctable, tea.Cmd) {
 	return t, nil
 }
 
-func (t ctable) totalWidth() int { return t.totalW }
+func (t *ctable) totalWidth() int { return t.totalW }
+
+// ColumnAt maps a header-line x coordinate to a column index, -1 when the
+// click falls on a gap or past the table. Widths match View's rendering.
+func (t *ctable) ColumnAt(x int) int {
+	start := 0
+	for i, c := range t.cols {
+		if x >= start && x < start+c.width {
+			return i
+		}
+		start += c.width + cellGap
+	}
+	return -1
+}
+
+// ClickRow moves the cursor to the visible row at view-relative y (0 is the
+// first row under the header line); out-of-frame clicks are ignored.
+func (t *ctable) ClickRow(y int) {
+	if y < 0 || len(t.rows) == 0 {
+		return
+	}
+	t.SetCursor(t.offset + y)
+}
 
 // cellGap mirrors the padding the previous bubbles table put between cells.
 const cellGap = 2
@@ -189,6 +216,10 @@ func (t ctable) renderRow(i int) string {
 			v = t.rowTint(i).Render(fitPlain(v, c.width))
 		case cellFlag:
 			v = flagCell(fitPlain(v, c.width))
+		case cellHubStatus:
+			v = hubStatusCell(fitPlain(v, c.width))
+		case cellAlert:
+			v = styleErr.Render(fitPlain(v, c.width))
 		default:
 			v = fitPlain(v, c.width)
 		}

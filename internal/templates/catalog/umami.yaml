@@ -1,0 +1,28 @@
+id: umami
+name: Umami
+description: Simple, privacy-focused alternative to Google Analytics.
+category: analytics
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/umami.png
+type: compose
+port: 3000
+public_service: umami
+compose: |
+  services:
+    umami:
+      image: ghcr.io/umami-software/umami:postgresql-latest
+      restart: unless-stopped
+      depends_on:
+        - postgres
+      environment:
+        DATABASE_TYPE: postgresql
+        DATABASE_URL: postgresql://umami:umami@postgres:5432/umami
+        APP_SECRET: change-me-to-a-random-string
+    postgres:
+      image: postgres:16-alpine
+      restart: unless-stopped
+      volumes:
+        - "{{id}}-db:/var/lib/postgresql/data"
+      environment:
+        POSTGRES_DB: umami
+        POSTGRES_USER: umami
+        POSTGRES_PASSWORD: umami

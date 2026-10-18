@@ -36,6 +36,15 @@ const (
 	viewDashboard
 	viewContainer
 	viewErrors
+	viewSettings
+	// Hub mode (Phase C2) appends after the direct-mode screens: route(),
+	// inputOwning, helpRows and viewBody all switch on this enum, and the hub
+	// screens extend each at the end so existing cases never move.
+	viewHubFleet
+	viewHubApps
+	viewHubDeployments
+	viewHubLogs
+	viewHubForm
 )
 
 // internal messages
@@ -100,6 +109,35 @@ type retryMsg struct {
 
 // retryAfter paces the single automatic reconnect. A var so tests can shrink it.
 var retryAfter = 5 * time.Second
+
+// severity colours a toast line: info green, warn amber, error red.
+type severity int
+
+const (
+	sevInfo severity = iota
+	sevWarn
+	sevError
+)
+
+// toast is one entry of the model-level notification queue. TTL is toastTTL;
+// expiry is an Update-time event (toastExpireMsg) so a toast survives repaints.
+type toast struct {
+	id  int
+	msg string
+	sev severity
+	at  time.Time
+}
+
+const toastTTL = 5 * time.Second
+const toastMax = 3
+
+// toastExpireMsg drops the toast with the given id. One tick per toast keeps
+// the "clears on its own tick" semantics the single dashboard toast had.
+type toastExpireMsg struct{ id int }
+
+func tickToast(id int) tea.Cmd {
+	return tea.Tick(toastTTL, func(time.Time) tea.Msg { return toastExpireMsg{id} })
+}
 
 // persistDoneMsg reports the outcome of a config/secret write that ran off the
 // UI goroutine. Success feedback is synchronous at the call site; only
@@ -248,12 +286,44 @@ type Model struct {
 	tags *TagStore
 	tag  tagPrompt
 
+	// cfg is the loaded settings.json; pal the `:` command palette; helpOpen
+	// the ? overlay. toasts is the model-level notification queue rendered
+	// bottom-right.
+	cfg      config.Settings
+	pal      palette
+	helpOpen bool
+	toasts   []toast
+	toastSeq int
+
+	settingsForm *settingsForm
+
+	// Hub mode state. hub is the daemon connection (nil until connected);
+	// hubLog reuses ContainerView for live deployment logs; hubForm collects
+	// URL + token; hubConfirm holds the pending deploy/rollback confirmation.
+	hub            *hubState
+	hubLog         *ContainerView
+	hubLogStop     func()
+	hubLogDep      string
+	hubLogVerb     string // "deploy" | "rollback" | "" (just viewing)
+	hubForm        *hubForm
+	hubConfirm     string
+	hubConfirmName string
+
+	// startCmd is run by Init, so main can hand --hub startup work to the UI
+	// goroutine before the first frame.
+	startCmd tea.Cmd
+
 	send     func(tea.Msg)
 	quitting bool
 	api      *httpapi.Store
 }
 
 func New(hosts []models.Host, tags map[string]models.Tag) *Model {
+	return NewWithSettings(hosts, tags, config.DefaultSettings())
+}
+
+// NewWithSettings builds the model with user preferences already resolved.
+func NewWithSettings(hosts []models.Host, tags map[string]models.Tag, cfg config.Settings) *Model {
 	m := &Model{
 		hosts:  hosts,
 		view:   viewHosts,
@@ -262,7 +332,10 @@ func New(hosts []models.Host, tags map[string]models.Tag) *Model {
 		api:    httpapi.NewStore(),
 		tags:   NewTagStore(tags),
 		tag:    newTagPrompt(),
+		cfg:    cfg,
+		pal:    newPalette(),
 	}
+	applyTheme(cfg.Theme)
 	m.list = NewHostList(hosts)
 	return m
 }
@@ -273,7 +346,12 @@ func (m *Model) HTTPStore() *httpapi.Store { return m.api }
 // Attach lets background goroutines deliver messages to the program.
 func (m *Model) Attach(send func(tea.Msg)) { m.send = send }
 
-func (m *Model) Init() tea.Cmd { return m.sp.Tick }
+func (m *Model) Init() tea.Cmd {
+	if m.startCmd != nil {
+		return tea.Batch(m.sp.Tick, m.startCmd)
+	}
+	return m.sp.Tick
+}
 
 func (m *Model) nextGen() uint64 {
 	m.genSeq++
@@ -352,6 +430,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.errView != nil {
 			m.errView.SetSize(msg.Width, contentH)
 		}
+		if m.hub != nil {
+			m.hub.SetSize(msg.Width, contentH)
+		}
+		if m.hubLog != nil {
+			m.hubLog.SetSize(msg.Width, contentH)
+		}
+		if m.hubForm != nil {
+			m.hubForm.SetSize(msg.Width)
+		}
 		for _, s := range m.sessions {
 			if s.dash != nil {
 				s.dash.SetSize(msg.Width, contentH)
@@ -369,11 +456,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.updateKey(msg)
 
+	case tea.MouseMsg:
+		return m.mouseEvent(msg)
+
+	case toastExpireMsg:
+		m.dropToast(msg.id)
+		return m, nil
+
 	case connectDoneMsg:
 		return m.onConnectDone(msg)
 
 	case persistDoneMsg:
 		return m.onPersistDone(msg)
+
+	case hubMsg:
+		return m.routeHub(msg)
 
 	case statsTickMsg, statsLoadedMsg, actionDoneMsg, logChunkMsg, logEndMsg, logOpenedMsg, logFlushMsg, detailLoadedMsg, diskLoadedMsg, imagesLoadedMsg, eventsMsg, exportDoneMsg, errLoadedMsg, shellExitedMsg, shellProbeDoneMsg, peaksLoadedMsg, perfTickMsg, perfLoadedMsg, retryMsg:
 		return m.route(msg)
@@ -417,6 +514,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The palette owns every key while open, before anything else looks.
+	if m.pal.open {
+		return m.updatePalette(msg)
+	}
+	// The ? overlay is a mode: while open it shows the current screen's key
+	// table and any key closes it. Inputs that own typing suppress the toggle.
+	if m.helpOpen {
+		m.helpOpen = false
+		return m, nil
+	}
+	if msg.String() == "?" && !m.tag.active && !m.inputOwning() {
+		m.helpOpen = true
+		return m, nil
+	}
+	if msg.String() == ":" && !m.tag.active && !m.inputOwning() {
+		return m, m.openPalette()
+	}
 	if m.view == viewHosts {
 		// Status expiry is an Update-time event, like the dashboard toast:
 		// the line survives repaints and clears on the next keypress.
@@ -431,8 +545,60 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "a" {
 			return m.openErrors()
 		}
+		// The pinned hub tab is reachable from the host list too: tab moves
+		// to it, H opens the connect form.
+		if m.hub != nil {
+			switch msg.String() {
+			case "tab":
+				return m, m.cycleTab(1)
+			case "shift+tab":
+				return m, m.cycleTab(-1)
+			}
+		}
+		if msg.String() == "H" {
+			url := ""
+			if m.hub != nil {
+				url = m.hub.url
+			}
+			m.hubForm = newHubForm(url)
+			m.view = viewHubForm
+			return m, nil
+		}
+		if msg.String() == "S" {
+			m.settingsForm = NewSettingsForm(m.cfg)
+			m.view = viewSettings
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+
+	case viewSettings:
+		next, cmd, saved, cancelled := m.settingsForm.Update(msg)
+		m.settingsForm = next
+		if saved {
+			// Theme applies to the running session immediately; the write itself
+			// runs off-thread via the form's persist command.
+			s := m.settingsForm.saved
+			m.cfg.Theme = s.Theme
+			m.cfg.Mouse = s.Mouse
+			m.cfg.LogWrap = s.LogWrap
+			applyTheme(s.Theme)
+			for _, ses := range m.sessions {
+				if ses.cv != nil {
+					ses.cv.wrap = s.LogWrap
+					ses.cv.rebuildRows()
+				}
+			}
+			m.settingsForm = nil
+			m.view = viewHosts
+			return m, tea.Batch(cmd, m.toast("settings saved", sevInfo))
+		}
+		if cancelled {
+			m.view = viewHosts
+			m.settingsForm = nil
+			return m, nil
+		}
 		return m, cmd
 
 	case viewForm:
@@ -493,8 +659,13 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.tag.active {
 			return m.updateTag(msg)
 		}
-		if handled, cmd := m.sessionKeys(msg.String()); handled {
-			return m, cmd
+		s := m.activeSession()
+		// The dashboard filter input owns the keys while open — same rule as
+		// the log view's filter below.
+		if s == nil || s.dash == nil || !s.dash.Filtering() {
+			if handled, cmd := m.sessionKeys(msg.String()); handled {
+				return m, cmd
+			}
 		}
 		switch msg.String() {
 		case "a":
@@ -504,7 +675,6 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "T":
 			return m.untagCursor()
 		}
-		s := m.activeSession()
 		if s == nil || s.dash == nil {
 			return m, nil
 		}
@@ -521,6 +691,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.cv = NewContainerView(req.id, req.name, m.width, m.height-m.tabRows())
 			s.cv.hostID = s.dash.hostID
 			s.cv.gen = s.dash.gen
+			s.cv.wrap = m.cfg.LogWrap
 			s.cv.SetTag(m.tags.Display(s.host.ID, req.name), m.tags.Tint(s.host.ID, req.name))
 			m.view = viewContainer
 			return m, startLogStream(s, req.id, m.send)
@@ -557,6 +728,12 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		if s != nil && s.cv != nil {
 			s.cv, cmd = s.cv.Update(msg)
+			if wrap, changed := s.cv.TakeWrapToggle(); changed {
+				m.cfg.LogWrap = wrap
+				return m, tea.Batch(cmd, persistCmd("saving settings", func() error {
+					return config.SaveSettings(m.settingsSnapshot(wrap))
+				}))
+			}
 		}
 		return m, cmd
 
@@ -604,8 +781,208 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.errView, cmd = m.errView.Update(msg)
 		return m, cmd
+
+	case viewHubForm:
+		next, cmd, submitted, cancelled := m.hubForm.Update(msg)
+		m.hubForm = next
+		if submitted {
+			u, tok := m.hubForm.URL(), m.hubForm.Token()
+			m.hubForm = nil
+			var cmds []tea.Cmd
+			if tok != "" {
+				// The keyring write runs off the UI thread; the connection
+				// starts immediately with the in-hand token either way.
+				ref := HubTokenRef(u)
+				cmds = append(cmds, persistCmd("storing the hub token", func() error {
+					return secret.Set(ref, tok)
+				}))
+			}
+			cmds = append(cmds, m.ConnectHub(u, tok))
+			return m, tea.Batch(cmds...)
+		}
+		if cancelled {
+			m.hubForm = nil
+			m.view = viewHosts
+			return m, nil
+		}
+		return m, cmd
+
+	case viewHubFleet, viewHubApps, viewHubDeployments, viewHubLogs:
+		return m.updateHub(msg)
 	}
 	return m, nil
+}
+
+// settingsSnapshot copies the model's current settings with the given wrap
+// mode, for persisting after a `w` toggle in the log view.
+func (m *Model) settingsSnapshot(wrap bool) config.Settings {
+	s := m.cfg
+	s.LogWrap = wrap
+	return s
+}
+
+// inputOwning reports whether a text input currently owns the keys, so `?` and
+// `:` must not hijack typing.
+func (m *Model) inputOwning() bool {
+	switch m.view {
+	case viewForm, viewPrompt, viewSettings, viewHubForm:
+		return true
+	case viewContainer:
+		if s := m.activeSession(); s != nil && s.cv != nil {
+			return s.cv.Searching()
+		}
+	case viewDashboard:
+		if s := m.activeSession(); s != nil && s.dash != nil {
+			return s.dash.Filtering()
+		}
+	case viewHubLogs:
+		return m.hubLog != nil && m.hubLog.Searching()
+	}
+	return false
+}
+
+// toast queues a severity-coloured notification, capped, and returns the
+// expiry tick command the caller must return — the model-level replacement
+// for the single dashboard line, with its clears-on-tick semantics per toast.
+func (m *Model) toast(msg string, sev severity) tea.Cmd {
+	if msg == "" {
+		return nil
+	}
+	m.toastSeq++
+	t := toast{id: m.toastSeq, msg: msg, sev: sev, at: time.Now()}
+	m.toasts = append(m.toasts, t)
+	if len(m.toasts) > toastMax {
+		m.toasts = m.toasts[len(m.toasts)-toastMax:]
+	}
+	return tickToast(t.id)
+}
+
+func (m *Model) dropToast(id int) {
+	out := m.toasts[:0]
+	for _, t := range m.toasts {
+		if t.id != id {
+			out = append(out, t)
+		}
+	}
+	m.toasts = out
+}
+
+// toastCmds schedules one expiry tick per queued toast.
+func (m *Model) toastCmds() tea.Cmd {
+	if len(m.toasts) == 0 {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for _, t := range m.toasts {
+		cmds = append(cmds, tickToast(t.id))
+	}
+	return tea.Batch(cmds...)
+}
+
+// applyToasts splices the toast lines into the frame's bottom-right corner,
+// stacked upward from just above the footer row.
+func (m *Model) applyToasts(frame string, w, h int) string {
+	if len(m.toasts) == 0 {
+		return frame
+	}
+	lines := strings.Split(frame, "\n")
+	base := len(lines) - 1 // the footer (or last body) row stays untouched
+	for i := range m.toasts {
+		t := m.toasts[len(m.toasts)-1-i] // newest at the bottom of the stack
+		y := base - 1 - i
+		if y < 0 || y >= len(lines) {
+			break
+		}
+		line := toastStyle(t.sev).Render(fitPlain(t.msg, max(w-2, 8)))
+		pad := clampInt(w-lipgloss.Width(line), 0, w)
+		lines[y] = padRight(strings.TrimRight(lines[y], " "), pad) + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+// mouseEvent translates mouse activity into the focused screen's native
+// actions: wheel = j/k, tab-bar click = switch session, dashboard clicks land
+// on the table via Dashboard.Click.
+func (m *Model) mouseEvent(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		return m.updateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	case tea.MouseButtonWheelDown:
+		return m.updateKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	case tea.MouseButtonLeft:
+		if msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+		switch m.view {
+		case viewDashboard, viewContainer, viewErrors:
+			if msg.Y == 0 && (len(m.sessions) > 0 || m.hub != nil) {
+				if i := m.tabIndexAt(msg.X); i >= 0 {
+					if i == len(m.sessions) {
+						return m, m.activateHub()
+					}
+					return m, m.activate(i)
+				}
+				return m, nil
+			}
+			y := msg.Y - m.tabRows()
+			if m.view == viewDashboard {
+				if s := m.activeSession(); s != nil && s.dash != nil {
+					s.dash.Click(msg.X, y)
+				}
+			}
+			return m, nil
+		case viewHubFleet, viewHubApps, viewHubDeployments:
+			// The tab bar row clicks switch surfaces; clicks in the table
+			// body move the cursor row.
+			if msg.Y == 0 {
+				if i := m.tabIndexAt(msg.X); i >= 0 {
+					if i == len(m.sessions) {
+						return m, m.activateHub()
+					}
+					return m, m.activate(i)
+				}
+				return m, nil
+			}
+			if h := m.hub; h != nil {
+				y := msg.Y - m.tabRows() - 2 // title + blank line above the table
+				switch m.view {
+				case viewHubFleet:
+					if h.showContainers {
+						h.contTbl.ClickRow(y)
+					} else {
+						h.fleetTbl.ClickRow(y)
+					}
+				case viewHubApps:
+					h.appsTbl.ClickRow(y)
+				case viewHubDeployments:
+					h.depsTbl.ClickRow(y)
+				}
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// tabIndexAt maps an x coordinate on the tab bar to a tab index: a session
+// index, or len(sessions) for the pinned hub tab; -1 between or past labels.
+func (m *Model) tabIndexAt(x int) int {
+	pos := 0
+	for i, s := range m.sessions {
+		label := fmt.Sprintf("%d %s ●", i+1, s.host.Name)
+		w := lipgloss.Width(label) + 2 // active-tab padding is part of the cell
+		if x >= pos && x < pos+w {
+			return i
+		}
+		pos += w + 3 // " │ " separator
+	}
+	if m.hub != nil {
+		if x >= pos && x < pos+lipgloss.Width("hub")+2 {
+			return len(m.sessions)
+		}
+	}
+	return -1
 }
 
 // sessionKeys handles multi-session navigation from dashboard/log views.
@@ -615,9 +992,9 @@ func (m *Model) sessionKeys(key string) (bool, tea.Cmd) {
 	}
 	switch key {
 	case "tab":
-		return true, m.activate((m.active + 1) % len(m.sessions))
+		return true, m.cycleTab(1)
 	case "shift+tab":
-		return true, m.activate((m.active - 1 + len(m.sessions)) % len(m.sessions))
+		return true, m.cycleTab(-1)
 	case "X":
 		return true, m.closeActive()
 	}
@@ -743,6 +1120,7 @@ func (m *Model) openLiveLog() (tea.Model, tea.Cmd) {
 	m.active = m.indexOf(s)
 	s.cv = NewContainerView(t.id, t.name, m.width, m.height-m.tabRows())
 	s.cv.hostID, s.cv.gen = s.host.ID, s.gen
+	s.cv.wrap = m.cfg.LogWrap
 	s.cv.SetTag(m.tags.Display(t.hostID, t.name), m.tags.Tint(t.hostID, t.name))
 	m.view = viewContainer
 	return m, startLogStream(s, t.id, m.send)
@@ -928,6 +1306,11 @@ func (m *Model) route(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t = msg.msgTag
 	case shellProbeDoneMsg:
 		t = msg.msgTag
+	}
+	// The hub log view shares logFlushMsg; its tag carries the hub host id,
+	// and hub messages never look up a session.
+	if t.hostID == hubHostID {
+		return m.routeHubLogFlush(t)
 	}
 	s := m.findSession(t.hostID, t.gen)
 	if s == nil {
@@ -1137,6 +1520,10 @@ func (m *Model) routeInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list, cmd = m.list.Update(msg)
 	case viewForm, viewPrompt:
 		m.form, _, _, _ = m.form.Update(msg)
+	case viewSettings:
+		if m.settingsForm != nil {
+			m.settingsForm, _, _, _ = m.settingsForm.Update(msg)
+		}
 	case viewDashboard:
 		if s := m.activeSession(); s != nil && s.dash != nil {
 			s.dash, cmd = s.dash.Update(msg)
@@ -1150,16 +1537,71 @@ func (m *Model) routeInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) View() string {
+	frame := m.viewBody()
+	frame = m.applyToasts(frame, m.width, m.height)
+	if m.pal.open {
+		frame = pasteOver(frame, m.palView(), m.width, m.height)
+	}
+	if m.helpOpen {
+		frame = helpOverlay(frame, m.helpTitle(), m.helpRows(), m.width, m.height)
+	}
+	return frame
+}
+
+// helpTitle names the screen the overlay is showing.
+func (m *Model) helpTitle() string {
+	switch m.view {
+	case viewHosts:
+		return "hosts"
+	case viewForm:
+		return "host form"
+	case viewPrompt:
+		return "unlock"
+	case viewDashboard:
+		if s := m.activeSession(); s != nil && s.dash != nil {
+			return s.dash.helpTitle()
+		}
+	case viewContainer:
+		return "logs"
+	case viewErrors:
+		return "errors"
+	case viewSettings:
+		return "settings"
+	case viewHubFleet:
+		return "hub fleet"
+	case viewHubApps:
+		return "hub apps"
+	case viewHubDeployments:
+		return "hub deployments"
+	case viewHubLogs:
+		return "logs"
+	case viewHubForm:
+		return "hub connect"
+	}
+	return "keys"
+}
+
+func (m *Model) viewBody() string {
 	if m.quitting {
 		return ""
 	}
 	switch m.view {
+	case viewSettings:
+		if m.settingsForm != nil {
+			return pinFooter(m.settingsForm.View(m.width), m.settingsForm.Help(), m.width, m.height)
+		}
+		return ""
 	case viewHosts:
 		body := styleTitle.Render("vpstui — VPS & containers over SSH") + "\n\n" + m.list.View()
 		if m.status != "" {
 			body += "\n" + styleWarn.Render(m.status)
 		}
-		return pinFooter(body, helpLine("↑/↓ j/k", "move", "n", "new", "e", "edit", "d", "delete", "enter", "connect/resume", "q", "quit"), m.width, m.height)
+		// Hub mode pins its tab onto the host list as well; pure direct-mode
+		// rendering (no hub) stays byte-identical to before.
+		if m.hub != nil {
+			body = m.tabBar() + "\n" + body
+		}
+		return pinFooter(body, helpBar(m.helpRows(), 5), m.width, m.height)
 	case viewForm, viewPrompt:
 		return pinFooter(m.form.View(m.width), m.form.Help(), m.width, m.height)
 	case viewConnecting:
@@ -1193,20 +1635,28 @@ func (m *Model) View() string {
 			body = bar + "\n" + body
 		}
 		return body
+	case viewHubFleet, viewHubApps, viewHubDeployments, viewHubLogs:
+		return m.hubBody()
+	case viewHubForm:
+		if m.hubForm != nil {
+			return pinFooter(m.hubForm.View(m.width), m.hubForm.Help(), m.width, m.height)
+		}
+		return ""
 	}
 	return ""
 }
 
-// tabRows is the number of layout rows the session tab bar occupies.
+// tabRows is the number of layout rows the session tab bar occupies. The
+// pinned hub tab keeps the bar up even with no direct session connected.
 func (m *Model) tabRows() int {
-	if len(m.sessions) == 0 {
+	if len(m.sessions) == 0 && m.hub == nil {
 		return 0
 	}
 	return 1
 }
 
 func (m *Model) tabBar() string {
-	if len(m.sessions) == 0 {
+	if len(m.sessions) == 0 && m.hub == nil {
 		return ""
 	}
 	var parts []string
@@ -1216,10 +1666,17 @@ func (m *Model) tabBar() string {
 			dot = "●"
 		}
 		label := fmt.Sprintf("%d %s %s", i+1, s.host.Name, dot)
-		if i == m.active {
+		if i == m.active && !isHubView(m.view) {
 			parts = append(parts, lipglossActiveTab().Render(label))
 		} else {
 			parts = append(parts, styleMuted.Render(label))
+		}
+	}
+	if m.hub != nil {
+		if isHubView(m.view) {
+			parts = append(parts, lipglossActiveTab().Render("hub"))
+		} else {
+			parts = append(parts, styleMuted.Render("hub"))
 		}
 	}
 	return strings.Join(parts, styleMuted.Render(" │ "))
@@ -1237,6 +1694,7 @@ func (m *Model) cleanup() {
 	m.sessions = nil
 	m.active = -1
 	m.quitting = true
+	m.stopHub()
 	if m.api != nil {
 		m.api.Close()
 	}
@@ -1392,10 +1850,10 @@ func (m *Model) onConnectDone(msg connectDoneMsg) (tea.Model, tea.Cmd) {
 				return m.openPrompt(msg.host, label+msg.host.User+"@"+msg.host.Address)
 			}
 			m.status = "connect failed: " + es
-			return m, nil
+			return m, m.toast("connect failed: "+es, sevError)
 		}
 		m.status = "connect " + msg.host.Name + " failed: " + es
-		return m, nil
+		return m, m.toast("connect "+msg.host.Name+" failed: "+es, sevError)
 	}
 	s.conn = msg.conn
 	s.retried = false // a fresh generation earns its one automatic retry back
@@ -1431,14 +1889,15 @@ func (m *Model) onPersistDone(msg persistDoneMsg) (tea.Model, tea.Cmd) {
 	if msg.err == nil {
 		return m, nil
 	}
+	tcmd := m.toast(msg.what+" failed: "+msg.err.Error(), sevError)
 	if m.view == viewDashboard {
 		if s := m.activeSession(); s != nil && s.dash != nil {
 			s.dash.SetToast(msg.what+" failed: "+msg.err.Error(), true)
-			return m, nil
+			return m, tcmd
 		}
 	}
 	m.status = msg.what + " failed: " + msg.err.Error()
-	return m, nil
+	return m, tcmd
 }
 
 // startEvents opens one docker events stream per generation. Each parsed

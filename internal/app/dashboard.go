@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -133,6 +134,20 @@ type Dashboard struct {
 	// grouping. Cycled with < and >; resets with the generation on reconnect.
 	sortMode int
 
+	// filter is the user's substring over name + tag + image. It applies before
+	// grouping and sorting: rebuild drops non-matching containers, and a compose
+	// group whose children all dropped hides with them. filtering marks the
+	// inline input as owning the keys; esc steps out of the input, then clears
+	// the filter, then leaves the screen — the log view's ladder.
+	filter    string
+	filtering bool
+	fin       textinput.Model
+
+	// marked holds the multi-select set by container ID, so marks survive
+	// re-sorting and refetches. s/x/r act on the whole set when non-empty;
+	// D always stays single-row.
+	marked map[string]bool
+
 	// evArmed makes the docker events stream once-per-generation, exactly like
 	// errArmed. evPending marks an event burst that arrived while a snapshot
 	// fetch was in flight; the next statsLoadedMsg flushes it as one refetch.
@@ -225,11 +240,15 @@ func NewDashboard(host models.Host, dock *docker.Executor, w, h int, gen uint64)
 	d := &Dashboard{
 		host: host, dock: dock, hostID: host.ID, gen: gen,
 		stats: map[string]models.ContainerStats{}, collapsed: map[string]bool{},
+		marked:    map[string]bool{},
 		perf:      perf.New(perf.Cap, perf.Horizon),
 		peaks:     map[string]models.ContainerPeak{},
 		perfNames: map[string]string{},
 		width:     w, height: h,
 	}
+	d.fin = textinput.New()
+	d.fin.Placeholder = "filter"
+	d.fin.CharLimit = 64
 	d.tbl.SetColumns(colsFor(max(w-2, 20)))
 	d.tbl.SetSize(max(w-2, 20), max(h-10, 3))
 	d.perfTbl.SetColumns(perfColsFor(max(w-2, 20)))
@@ -570,6 +589,21 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 		return d, d.fetchNow()
 
 	case tea.KeyMsg:
+		if d.filtering {
+			// The filter input owns the keys while open, exactly like the log
+			// view's filter: session hotkeys must not fire mid-query.
+			switch msg.String() {
+			case "enter", "esc":
+				d.filtering = false
+				d.fin.Blur()
+				d.applyFilter()
+				return d, nil
+			}
+			var cmd tea.Cmd
+			d.fin, cmd = d.fin.Update(msg)
+			d.applyFilter()
+			return d, cmd
+		}
 		if d.detail != nil {
 			switch msg.String() {
 			case "esc", "q", "d", "x", "enter":
@@ -612,26 +646,11 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 						return actionDoneMsg{msgTag: t, verb: verb, name: name, err: dock.ImageRm(ctx, id)}
 					}
 				}
-				c, ok := d.selected()
-				if !ok {
+				targets := d.actionTargets()
+				if len(targets) == 0 {
 					return d, nil
 				}
-				return d, func() tea.Msg {
-					ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-					defer cancel()
-					var err error
-					switch verb {
-					case "start":
-						err = dock.Start(ctx, c.ID)
-					case "stop":
-						err = dock.Stop(ctx, c.ID)
-					case "restart":
-						err = dock.Restart(ctx, c.ID)
-					case "rm":
-						err = dock.Rm(ctx, c.ID)
-					}
-					return actionDoneMsg{msgTag: t, verb: verb, name: c.ShortName(), err: err}
-				}
+				return d, d.batchAction(verb, targets)
 			case "n", "N", "esc":
 				d.confirm = ""
 				return d, nil
@@ -697,7 +716,32 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			}
 			return d, nil
 		case "esc", "q":
+			// Step-out ladder: a committed filter clears first, then the screen
+			// goes back — the same semantics the log view's esc uses.
+			if d.filter != "" {
+				d.filter = ""
+				d.fin.SetValue("")
+				d.rebuild()
+				return d, nil
+			}
 			d.back = true
+			return d, nil
+		case "/":
+			d.filtering = true
+			d.fin.SetValue(d.filter)
+			d.fin.CursorEnd()
+			return d, d.fin.Focus()
+		case "v":
+			if c, ok := d.selected(); ok {
+				if d.marked[c.ID] {
+					delete(d.marked, c.ID)
+				} else {
+					d.marked[c.ID] = true
+				}
+			}
+			return d, nil
+		case "V":
+			d.marked = map[string]bool{}
 			return d, nil
 		case "f":
 			// Refresh re-arms the sweep and the cgroup probe too, so "f" is the
@@ -711,17 +755,17 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			}
 			return d, nil
 		case "s":
-			if _, ok := d.selected(); ok {
+			if _, ok := d.selected(); ok || len(d.marked) > 0 {
 				d.confirm = "start"
 			}
 			return d, nil
 		case "x":
-			if _, ok := d.selected(); ok {
+			if _, ok := d.selected(); ok || len(d.marked) > 0 {
 				d.confirm = "stop"
 			}
 			return d, nil
 		case "r":
-			if _, ok := d.selected(); ok {
+			if _, ok := d.selected(); ok || len(d.marked) > 0 {
 				d.confirm = "restart"
 			}
 			return d, nil
@@ -743,16 +787,10 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 			// first container list armed, so opening it usually shows numbers at once.
 			return d, d.openPerf()
 		case "<":
-			d.sortMode = (d.sortMode + sortCount - 1) % sortCount
-			d.rebuild()
-			d.toast = "sort: " + sortNames[d.sortMode]
-			d.toastIsErr = false
+			d.setSort((d.sortMode + sortCount - 1) % sortCount)
 			return d, nil
 		case ">":
-			d.sortMode = (d.sortMode + 1) % sortCount
-			d.rebuild()
-			d.toast = "sort: " + sortNames[d.sortMode]
-			d.toastIsErr = false
+			d.setSort((d.sortMode + 1) % sortCount)
 			return d, nil
 		case "D":
 			if c, ok := d.selected(); ok {
@@ -803,13 +841,15 @@ func (d *Dashboard) Update(msg tea.Msg) (*Dashboard, tea.Cmd) {
 func (d *Dashboard) rebuild() {
 	cur := d.tbl.Cursor()
 
+	// The filter applies before grouping and sorting: a container that does not
+	// match simply is not in the candidate set, so a compose group whose
+	// children all dropped never emits its header row either.
+	pool := d.filteredIdx()
+
 	if d.sortMode != sortGrouped {
 		// Flat sort: every container in one list, no compose headers. The
 		// standalone branch's row assembly verbatim, then the same common tail.
-		idx := make([]int, len(d.containers))
-		for i := range idx {
-			idx[i] = i
-		}
+		idx := pool
 		less := d.sortLess(d.sortMode)
 		sort.SliceStable(idx, func(x, y int) bool { return less(idx[x], idx[y]) })
 		rows := make([][]string, 0, len(d.containers))
@@ -840,8 +880,8 @@ func (d *Dashboard) rebuild() {
 
 	byProj := map[string][]int{}
 	var order []string
-	for i, c := range d.containers {
-		p := c.ComposeProject()
+	for _, i := range pool {
+		p := d.containers[i].ComposeProject()
 		if _, ok := byProj[p]; !ok {
 			order = append(order, p)
 		}
@@ -965,8 +1005,12 @@ func (d *Dashboard) containerRow(c models.Container) []string {
 		cpu, mem, memUsage = s.CPUPerc, s.MemPerc, s.MemUsage
 	}
 	// The label goes first so a narrow terminal clips the docker name's tail,
-	// never the word the user chose.
-	return []string{d.tags.Display(d.host.ID, c.ShortName()), c.Image, c.State, c.Status, cpu, mem, memUsage}
+	// never the word the user chose. A multi-select mark takes the gutter.
+	name := d.tags.Display(d.host.ID, c.ShortName())
+	if d.marked[c.ID] {
+		name = "* " + name
+	}
+	return []string{name, c.Image, c.State, c.Status, cpu, mem, memUsage}
 }
 
 // tagColorOf is the row's tint for ctable: the palette name, or "" for plain.
@@ -985,6 +1029,179 @@ func (d *Dashboard) toggleFold() {
 	}
 	d.collapsed[p] = !d.collapsed[p]
 	d.rebuild()
+}
+
+// Filtering reports whether the dashboard's filter input owns the keys. Root
+// must not run sessionKeys while it does — the same focus rule as the log view.
+func (d *Dashboard) Filtering() bool { return d.filtering }
+
+// filteredIdx is the candidate set the table is built from: every container
+// whose name, label or image contains the filter (case-insensitive). No filter
+// means every container, in list order.
+func (d *Dashboard) filteredIdx() []int {
+	if d.filter == "" {
+		idx := make([]int, len(d.containers))
+		for i := range idx {
+			idx[i] = i
+		}
+		return idx
+	}
+	q := strings.ToLower(d.filter)
+	var idx []int
+	for i, c := range d.containers {
+		hay := strings.ToLower(c.ShortName() + "\n" + d.tags.Display(d.host.ID, c.ShortName()) + "\n" + c.Image)
+		if strings.Contains(hay, q) {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+func (d *Dashboard) applyFilter() {
+	d.filter = strings.TrimSpace(d.fin.Value())
+	d.rebuild()
+}
+
+// actionTargets is the set s/x/r act on: the marked set when non-empty, else
+// the row under the cursor. Destructive rm never joins — D stays single-row.
+func (d *Dashboard) actionTargets() []models.Container {
+	if len(d.marked) > 0 {
+		var out []models.Container
+		for _, c := range d.containers {
+			if d.marked[c.ID] {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	if c, ok := d.selected(); ok {
+		return []models.Container{c}
+	}
+	return nil
+}
+
+// batchAction runs the verb against every target, one command each so one slow
+// or failing container cannot hide the others' results.
+func (d *Dashboard) batchAction(verb string, targets []models.Container) tea.Cmd {
+	dock := d.dock
+	t := msgTag{hostID: d.hostID, gen: d.gen}
+	cmds := make([]tea.Cmd, 0, len(targets))
+	for _, c := range targets {
+		c := c
+		cmds = append(cmds, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+			defer cancel()
+			var err error
+			switch verb {
+			case "start":
+				err = dock.Start(ctx, c.ID)
+			case "stop":
+				err = dock.Stop(ctx, c.ID)
+			case "restart":
+				err = dock.Restart(ctx, c.ID)
+			}
+			return actionDoneMsg{msgTag: t, verb: verb, name: c.ShortName(), err: err}
+		})
+	}
+	return tea.Batch(cmds...)
+}
+
+// headerLines is how many rows View writes above the table in the plain
+// dashboard mode (no detail pane, no sub-panel). Click handling maps screen
+// rows with it; it must stay in step with View's header writes.
+func (d *Dashboard) headerLines() int {
+	n := 1 // title
+	if d.hasHostStats {
+		n++
+	}
+	if d.disconnected {
+		n++
+	}
+	if d.confirm != "" || d.prompt != "" || d.toast != "" {
+		n++
+	}
+	if d.errMsg != "" {
+		n++
+	}
+	if d.filter != "" || d.filtering {
+		n++
+	}
+	return n + 1 // blank separator line
+}
+
+// Click maps a mouse click at dashboard-relative (x, y) onto the table: the
+// header row cycles that column's sort, a data row moves the cursor.
+func (d *Dashboard) Click(x, y int) {
+	if d.detail != nil || d.showPerf || d.showDisk || d.showImages || d.filtering {
+		return
+	}
+	if y == d.headerLines() {
+		switch d.tbl.ColumnAt(x) {
+		case 0:
+			d.setSort(sortName)
+		case 2:
+			d.setSort(sortState)
+		case 4:
+			d.setSort(sortCPU)
+		case 5:
+			d.setSort(sortMem)
+		default:
+			d.setSort((d.sortMode + 1) % sortCount)
+		}
+		return
+	}
+	d.tbl.ClickRow(y - d.headerLines() - 1)
+}
+
+func (d *Dashboard) setSort(mode int) {
+	d.sortMode = mode
+	d.rebuild()
+	d.toast = "sort: " + sortNames[d.sortMode]
+	d.toastIsErr = false
+}
+
+// helpTitle names this dashboard's sub-mode for the ? overlay.
+func (d *Dashboard) helpTitle() string {
+	switch {
+	case d.detail != nil:
+		return "detail"
+	case d.showPerf:
+		return "perf"
+	case d.showImages:
+		return "images"
+	case d.showDisk:
+		return "disk"
+	}
+	return "dashboard"
+}
+
+// helpRows is this dashboard's full key table, resolved by sub-mode — the one
+// source both the help bar and the ? overlay render.
+func (d *Dashboard) helpRows() []keyHelp {
+	switch {
+	case d.detail != nil:
+		return []keyHelp{{"esc", "close"}, {"d", "close"}, {"f", "refresh"}}
+	case d.showPerf:
+		return []keyHelp{
+			{"j/k g/G", "nav"}, {"enter", "logs"}, {"t", "tag"}, {"T", "untag"},
+			{"i", "disk"}, {"f", "re-probe"}, {"esc", "close"},
+		}
+	case d.showImages:
+		return []keyHelp{{"D", "remove image"}, {"f", "refresh"}, {"esc", "close"}}
+	case d.showDisk:
+		return []keyHelp{
+			{"p", "prune images"}, {"P", "prune system"}, {"f", "refresh"}, {"esc", "close"},
+		}
+	case d.disconnected:
+		return []keyHelp{{"c", "reconnect"}, {"esc", "back"}}
+	}
+	return []keyHelp{
+		{"↑/↓ j/k", "nav"}, {"g/G", "top/bot"}, {"enter", "logs"}, {"d", "detail"},
+		{"space", "fold"}, {"s", "start"}, {"x", "stop"}, {"r", "restart"}, {"D", "rm"},
+		{"e", "shell"}, {"i", "disk"}, {"p", "perf"}, {"</>", "sort"}, {"/", "filter"},
+		{"v/V", "mark"}, {"t", "tag"}, {"T", "untag"}, {"a", "errors"},
+		{"f", "refresh"}, {"esc", "back"},
+	}
 }
 
 func detailText(det models.ContainerDetail) string {
@@ -1040,6 +1257,12 @@ func (d *Dashboard) View() string {
 			// No object name: the whole host is the target.
 		case label == "rm image" && d.imgConfirm != nil:
 			label = fmt.Sprintf("%s %s:%s", label, d.imgConfirm.Repository, d.imgConfirm.Tag)
+		case d.confirm == "start" || d.confirm == "stop" || d.confirm == "restart":
+			if len(d.marked) > 0 {
+				label = fmt.Sprintf("%s %d marked containers", d.confirm, len(d.marked))
+			} else if c, ok := d.selected(); ok {
+				label = fmt.Sprintf("%s %s", d.confirm, c.ShortName())
+			}
 		default:
 			if c, ok := d.selected(); ok {
 				label = fmt.Sprintf("%s %s", d.confirm, c.ShortName())
@@ -1059,6 +1282,11 @@ func (d *Dashboard) View() string {
 	if d.errMsg != "" {
 		b.WriteString(styleErr.Render(d.errMsg) + "\n")
 	}
+	if d.filtering {
+		b.WriteString(styleKey.Render("⌕ ") + d.fin.View() + "\n")
+	} else if d.filter != "" {
+		b.WriteString(styleKey.Render("filter: "+d.filter) + "\n")
+	}
 	b.WriteString("\n")
 	if d.detail != nil {
 		var inner strings.Builder
@@ -1076,10 +1304,10 @@ func (d *Dashboard) View() string {
 				styleMuted.Render("  (docker name: "+tag.Name+")") + "\n")
 		}
 		b.WriteString(panel(styleTitle.Render("detail — "+d.detail.name), inner.String(), d.width) + "\n")
-		return pinFooter(b.String(), helpLine("esc", "close", "d", "close", "f", "refresh"), d.width, d.height)
+		return pinFooter(b.String(), helpBar(d.helpRows(), 5), d.width, d.height)
 	}
 	if d.showPerf {
-		footer := helpLine("j/k g/G", "nav", "enter", "logs", "t", "tag", "T", "untag", "i", "disk", "f", "re-probe", "esc", "close")
+		footer := helpBar(d.helpRows(), 5)
 		status := d.perfStatus() + "\n"
 		head := b.String() + status
 		// The frame is exact: the table gets whatever the header and the footer
@@ -1094,7 +1322,7 @@ func (d *Dashboard) View() string {
 		return pinFooter(b.String(), footer, d.width, d.height)
 	}
 	if d.showImages {
-		footer := helpLine("D", "remove image", "f", "refresh", "esc", "close")
+		footer := helpBar(d.helpRows(), 5)
 		if d.imgLoading {
 			b.WriteString(styleMuted.Render("querying…") + "\n")
 		} else if d.imgErr != "" {
@@ -1127,17 +1355,13 @@ func (d *Dashboard) View() string {
 			}
 		}
 		b.WriteString(panel(styleTitle.Render("disk usage"), inner.String(), d.width) + "\n")
-		return pinFooter(b.String(), helpLine("p", "prune images", "P", "prune system", "f", "refresh", "esc", "close"), d.width, d.height)
+		return pinFooter(b.String(), helpBar(d.helpRows(), 5), d.width, d.height)
 	}
 	if len(d.containers) == 0 && d.errMsg == "" && !d.disconnected {
-		b.WriteString(styleMuted.Render("no containers found on this host") + "\n")
+		b.WriteString(styleMuted.Render("no containers on this host") + "\n")
+	} else if d.filter != "" && len(d.rowCIdx) == 0 {
+		b.WriteString(styleMuted.Render("nothing matches '"+d.filter+"' — esc clears") + "\n")
 	}
 	b.WriteString(d.tbl.View() + "\n")
-	var footer string
-	if d.disconnected {
-		footer = helpLine("c", "reconnect", "esc", "back")
-	} else {
-		footer = helpLine("↑/↓ j/k", "nav", "g/G", "top/bot", "enter", "logs", "d", "detail", "space", "fold", "s", "start", "x", "stop", "r", "restart", "D", "rm", "e", "shell", "i", "disk", "p", "perf", "<", "sort", ">", "sort", "t", "tag", "T", "untag", "a", "errors", "f", "refresh", "esc", "back")
-	}
-	return pinFooter(b.String(), footer, d.width, d.height)
+	return pinFooter(b.String(), helpBar(d.helpRows(), 5), d.width, d.height)
 }

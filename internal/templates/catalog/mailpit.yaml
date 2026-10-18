@@ -1,0 +1,8 @@
+id: mailpit
+name: Mailpit
+description: Email testing tool for developers — SMTP catch-all with a web UI.
+category: development
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/mailpit.png
+type: image
+image: axllent/mailpit:latest
+port: 8025

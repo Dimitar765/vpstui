@@ -1,0 +1,8 @@
+id: dozzle
+name: Dozzle
+description: Real-time log viewer for Docker containers with search and multi-container view.
+category: development
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/dozzle.png
+type: image
+image: amir20/dozzle:latest
+port: 8080

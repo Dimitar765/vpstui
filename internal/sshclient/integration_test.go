@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
 	"vpstui/internal/models"
@@ -214,6 +215,20 @@ func (s *testServer) handleChannel(newCh ssh.NewChannel, exec func(string) (stri
 	}
 	defer ch.Close()
 	for req := range reqs {
+		// pkg/sftp's client opens a session channel and requests the sftp
+		// subsystem on it; serve sftp over that same channel.
+		if req.Type == "subsystem" {
+			if len(req.Payload) >= 4 && string(req.Payload[4:]) == "sftp" {
+				req.Reply(true, nil)
+				srv, err := sftp.NewServer(ch)
+				if err == nil {
+					srv.Serve()
+				}
+				return
+			}
+			req.Reply(false, nil)
+			continue
+		}
 		if req.Type != "exec" {
 			if req.WantReply {
 				req.Reply(true, nil)

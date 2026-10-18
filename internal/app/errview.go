@@ -472,16 +472,22 @@ func statusLine(s lipgloss.Style, text string, width int) string {
 }
 
 func (e *ErrorsView) help() string {
-	if e.expanded >= 0 {
-		// 54 cells: the widest this screen is ever asked to fit is the 60-column
-		// terminal the pane test walks, and the pane gives up a sample row rather
-		// than push the footer off the frame.
-		return helpLine("esc", "close", "l", "live", "y/Y", "yank",
-			"m/w", "mode", "r", "sweep", "q", "back")
-	}
 	// 77 cells, the same budget the previous eight-pair bar used: pinFooter counts
 	// this as one row, so a bar that wraps lands past the last line of the frame.
 	// The status block spells out what m and w currently mean.
-	return helpLine("j/k g/G", "nav", "enter", "open", "l", "live", "y/Y", "yank",
-		"t", "tag", "m/w", "mode", "r", "sweep", "esc", "back")
+	return helpBar(e.helpRows(), 5)
+}
+
+// helpRows is the errors screen's full key table, resolved by expand state.
+func (e *ErrorsView) helpRows() []keyHelp {
+	if e.expanded >= 0 {
+		return []keyHelp{
+			{"esc", "close"}, {"l", "live"}, {"y/Y", "yank"},
+			{"m/w", "mode"}, {"r", "sweep"}, {"q", "back"},
+		}
+	}
+	return []keyHelp{
+		{"j/k g/G", "nav"}, {"enter", "open"}, {"l", "live"}, {"y/Y", "yank"},
+		{"t", "tag"}, {"m/w", "mode"}, {"r", "sweep"}, {"esc", "back"},
+	}
 }

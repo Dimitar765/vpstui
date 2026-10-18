@@ -1,0 +1,10 @@
+id: grafana
+name: Grafana
+description: Observability dashboards for metrics, logs and traces.
+category: monitoring
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/grafana.png
+type: image
+image: grafana/grafana:latest
+port: 3000
+volumes:
+  - "{{id}}-data:/var/lib/grafana"

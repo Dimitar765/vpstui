@@ -38,6 +38,23 @@ func (e *Executor) exec(ctx context.Context, timeout time.Duration, cmd string) 
 	return out, nil
 }
 
+// Quote exposes the shell-quoting helper to server-side packages (deploy
+// engine, proxy) that build remote commands through deploy.Runner. Same
+// invariant as before: no user-influenced value reaches a shell unquoted.
+func Quote(s string) string { return quote(s) }
+
+// Run is the exported passthrough the deploy.Runner interface binds to.
+func (e *Executor) Run(ctx context.Context, timeout time.Duration, cmd string) (string, string, error) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return e.conn.Exec(cctx, cmd)
+}
+
+// RunStream is the exported passthrough the deploy.Runner interface binds to.
+func (e *Executor) RunStream(ctx context.Context, cmd string) (io.ReadCloser, error) {
+	return e.conn.StreamExec(ctx, cmd)
+}
+
 func friendly(stderr string, err error) error {
 	// The typed connection-loss signal must reach the app layer intact — the
 	// auto-retry keys on errors.Is — so it passes through untransformed.

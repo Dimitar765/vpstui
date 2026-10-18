@@ -357,7 +357,7 @@ func TestTagPromptKeys(t *testing.T) {
 	if len(m.tags.All()) != 0 {
 		t.Errorf("esc saved %+v", m.tags.All())
 	}
-	if last := lastLine(s.dash.View()); !strings.Contains(last, "esc") || !strings.Contains(last, "back") {
+	if last := lastLine(s.dash.View()); !strings.Contains(last, "more") {
 		t.Errorf("footer is not the last row after closing the prompt: %q", last)
 	}
 

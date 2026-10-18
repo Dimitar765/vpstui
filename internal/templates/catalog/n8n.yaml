@@ -1,0 +1,10 @@
+id: n8n
+name: n8n
+description: Fair-code workflow automation with a visual editor and 400+ integrations.
+category: automation
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/n8n.png
+type: image
+image: n8nio/n8n:latest
+port: 5678
+volumes:
+  - "{{id}}-data:/home/node/.n8n"

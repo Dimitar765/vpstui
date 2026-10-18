@@ -1,0 +1,10 @@
+id: vaultwarden
+name: Vaultwarden
+description: Lightweight Bitwarden-compatible password vault for individuals and teams.
+category: security
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/vaultwarden.png
+type: image
+image: vaultwarden/server:latest
+port: 80
+volumes:
+  - "{{id}}-data:/data"

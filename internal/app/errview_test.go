@@ -123,8 +123,8 @@ func TestErrorsViewFrames(t *testing.T) {
 			if got := h(e.help()); got != 1 {
 				t.Errorf("help bar is %d rows, want 1", got)
 			}
-			if last := lastLine(v); !strings.Contains(last, "esc") || !strings.Contains(last, "back") {
-				t.Errorf("footer not pinned as the last row: %q", last)
+			if last := lastLine(v); !strings.Contains(last, "more") {
+				t.Errorf("footer (top-5 + ? more) not pinned as the last row: %q", last)
 			}
 			for _, w := range tc.want {
 				if !strings.Contains(v, w) {
@@ -617,8 +617,8 @@ func TestErrorsExpandedPaneFitsADeepCorpus(t *testing.T) {
 				t.Errorf("w=%d rows=%d: frame is %d cols", w, rows, got)
 			}
 			last := lastLine(v)
-			if !strings.Contains(last, "esc") || !strings.Contains(last, "back") {
-				t.Errorf("w=%d rows=%d: footer is not the last row: %q", w, rows, last)
+			if !strings.Contains(last, "more") {
+				t.Errorf("w=%d rows=%d: footer (top-5 + ? more) is not the last row: %q", w, rows, last)
 			}
 			// The pane must still say something useful at the smallest size.
 			if !strings.Contains(v, "connection reset by peer") {

@@ -1,7 +1,11 @@
 # vpstui
 
 A terminal UI (TUI) for managing and monitoring Docker containers on remote
-VPS servers over SSH, written in Go.
+VPS servers over SSH, written in Go — plus `vpstui-server`, a self-hosted
+PaaS daemon (Coolify/Dokploy class) that turns the same agentless SSH
+transport into deployments, domains with automatic TLS, managed databases,
+one-click templates, webhooks, notifications and alert rules, with an
+embedded web GUI and a hub mode in the TUI.
 
 ## Features
 
@@ -80,13 +84,31 @@ VPS servers over SSH, written in Go.
 - **Local JSON API + web view** — the running TUI publishes live session data
   on `http://127.0.0.1:8712`, with a bundled zero-build dashboard at `/`
   (Sessions, Performance, Network and Errors tabs). See [Web API](#web-api).
+- **Refinements** — `?` opens a per-screen key reference overlay, `:` a fuzzy
+  command palette (`connect`, `logs`, `sort`, screen jumps, `quit`), `/`
+  filters the dashboard (name/tag/image, applied before grouping), `v`/`V`
+  multi-select rows so `s`/`x`/`r` batch with one confirmation, the mouse
+  scrolls rows and clicks tabs/headers/sort cells, results arrive as stacked
+  severity-coloured toasts, `S` opens a settings screen (theme, mouse, log
+  wrap, HTTP address — persisted to `~/.config/vpstui/settings.json`, env
+  vars win), and `w` toggles soft-wrapping of long log lines.
+- **Hub mode** — `./vpstui --hub <url>` (or `H` from the host list) attaches
+  the TUI to a `vpstui-server`: fleet table with live WS updates, apps,
+  one-key deploys (`d`), rollbacks (`R`) and live deployment logs, all as a
+  pinned tab that coexists with direct SSH sessions. Tags follow you across
+  modes. See [vpstui-server](#vpstui-server--the-paas-daemon).
 
 ## Run
 
 ```sh
-go build -o vpstui .
-./vpstui
+go build -o vpstui .            # or: make build
+./vpstui                        # direct SSH mode, exactly as always
+./vpstui --hub http://127.0.0.1:8713   # attach to a vpstui-server instead
 ```
+
+In hub mode `H` on the host list opens the same connection form later; the
+hub token is stored in the keyring keyed by URL. See
+[vpstui-server](#vpstui-server--the-paas-daemon).
 
 Keys are shown in the help bar of each screen; `ctrl+c` quits from anywhere.
 Vim-style navigation works throughout: `j`/`k` move rows or scroll, `g`/`G`
@@ -509,3 +531,63 @@ The all-time peak probe additionally reads each container's cgroup files
 (`memory.peak` and `cpu.stat` on v2, `memory.max_usage_in_bytes` and `cpuacct.usage`
 on v1) as your SSH user; where none of them can be read the window columns still work
 and the all-time columns report `-` beside a note saying so.
+
+## vpstui-server — the PaaS daemon
+
+`vpstui-server` is a single Go binary that manages fleets of servers over
+the same agentless SSH transport the TUI uses — no agent is ever installed
+on a managed server. It keeps state in SQLite (pure Go driver, no CGO) and
+serves an authenticated REST + WebSocket API with the web GUI embedded in
+the binary (static Next.js export — no Node in production).
+
+```sh
+go build -o vpstui-server ./cmd/vpstui-server
+./vpstui-server --listen 127.0.0.1:8713           # --data defaults to $XDG_DATA_HOME/vpstui-server
+```
+
+The first boot prints a one-time **setup token** (also written to
+`<data>/setup-token`, valid 15 minutes). Open `http://127.0.0.1:8713/`,
+create the admin account, and add servers (SSH address, user, key — the
+same trust-on-first-use rules as the TUI). Everything is then driven from
+the GUI, the REST API (bearer session or `vps_…` API keys created under
+Settings), or the TUI's hub mode.
+
+Capabilities:
+
+- **Deployments** — from an image, a compose YAML, a Dockerfile in a git
+  repo, a static site, or a one-click template. Each deploy uploads to
+  `<base_dir>/apps/<id>/releases/<release>` over SFTP (atomic writes),
+  runs `docker compose` under project `vpstui-<id>`, verifies health,
+  swaps `current` and prunes old releases (last 5). Rollback re-pins the
+  last good release. Deployments stream their logs over the API and WS,
+  and survive daemon restarts (interrupted runs are marked failed).
+- **Domains & TLS** — a per-server Traefik v3 + docker-socket-proxy stack
+  (`vpstui-proxy`, ports configurable per server) routes apps by label.
+  With `--acme-email` set, Traefik answers ACME HTTP/TLS challenges;
+  without it, domains serve plain HTTP and the GUI says so. User traffic
+  hits the resource's server directly — the control plane never relays.
+- **Managed databases** — postgres/mysql/redis/mongo with generated
+  credentials in the secret store (never SQLite), no published ports
+  unless asked (then loopback-only), scheduled backups (`cron` spec +
+  retention) via per-type sidecar dumps, one-click **Backup now**, and a
+  connection-string endpoint.
+- **One-click templates** — uptime-kuma, n8n, grafana, vaultwarden,
+  mailpit, dozzle, plausible, umami (`GET /api/templates`), deployed as
+  ordinary apps with persistent named volumes.
+- **Webhooks** — every app gets a `POST /api/hooks/<token>` URL; GitHub,
+  GitLab and generic `{"branch":…}` payloads are understood, optional
+  HMAC-SHA256 verification, branch matching against the app's configured
+  branch, `202` + queued deploy on match.
+- **Notifications & alerts** — channels for discord/slack/telegram/
+  generic webhook/email with per-event subscriptions and a test button;
+  alert rules on `load1`, `mem_pct`, `container_cpu_pct`,
+  `container_mem_pct`, `container_down` with sustain windows, firing/
+  resolved transitions pushed over WS and to channels.
+- **Monitoring** — per-server pollers (snapshot + docker-events
+  accelerator, the same discipline as the TUI) feed the fleet dashboard,
+  metric history (7 days) and cross-host error grouping.
+
+Build the GUI into the binary with `make web` (pnpm build + embed); the
+repository ships a stub so the daemon builds without Node. `make test`
+runs the full race suite. The API contract is documented in-tree
+(`internal/server/routes.go`, DTOs in `internal/apitypes`).

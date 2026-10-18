@@ -108,7 +108,7 @@ func (l *HostList) Update(msg tea.Msg) (*HostList, tea.Cmd) {
 
 func (l *HostList) View() string {
 	if len(l.hosts) == 0 {
-		return styleMuted.Render("no hosts yet — press n to add one")
+		return styleMuted.Render("no hosts yet — press n to add your first VPS")
 	}
 	return l.l.View()
 }

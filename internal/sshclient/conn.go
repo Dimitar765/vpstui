@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -306,6 +307,16 @@ func (c *Conn) connLost(err error) error {
 		return fmt.Errorf("%w: %v", ErrConnLost, err)
 	}
 	return err
+}
+
+// SFTP opens an SFTP subsystem client over the wrapped connection; the
+// caller owns closing it. Transport failures type as ErrConnLost like exec.
+func (c *Conn) SFTP() (*sftp.Client, error) {
+	cl, err := sftp.NewClient(c.client)
+	if err != nil {
+		return nil, c.connLost(fmt.Errorf("sftp: %w", err))
+	}
+	return cl, nil
 }
 
 // Exec runs cmd and returns buffered stdout/stderr. ctx controls the timeout.

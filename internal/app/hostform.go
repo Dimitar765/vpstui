@@ -307,8 +307,5 @@ func (f *HostForm) View(_ int) string {
 }
 
 func (f *HostForm) Help() string {
-	if f.mode == modeSecret {
-		return helpLine("enter", "submit", "esc", "cancel")
-	}
-	return helpLine("up/down", "fields", "enter", "next / save", "esc", "cancel")
+	return helpBar(hostFormRows(f.mode == modeSecret), 5)
 }

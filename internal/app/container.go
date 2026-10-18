@@ -99,6 +99,10 @@ type ContainerView struct {
 	hide      bool // true: drop non-matching rows; false: keep all and bold matches
 	searching bool
 	in        textinput.Model
+	wrap      bool // soft-wrap long lines; false truncates them horizontally
+	// wrapToggled latches the user's `w` presses so root can persist the new
+	// mode into settings.json; TakeWrapToggle reads and clears it.
+	wrapToggled bool
 
 	pending int
 	follow  bool // stick to the bottom as lines arrive
@@ -107,12 +111,12 @@ type ContainerView struct {
 	// flight; note carries the one-row result shown in the header.
 	note      string
 	exporting bool
-	dropped bool // history has been trimmed, so rows[0] is the marker
-	dirty   bool // rows changed since the last SetContent
-	err     string
-	running bool
-	width   int
-	height  int
+	dropped   bool // history has been trimmed, so rows[0] is the marker
+	dirty     bool // rows changed since the last SetContent
+	err       string
+	running   bool
+	width     int
+	height    int
 
 	reader io.ReadCloser
 }
@@ -296,7 +300,14 @@ func (c *ContainerView) rebuildRows() {
 		if mark {
 			hits = append(hits, len(rows))
 		}
-		rows = append(rows, styleLine(line, c.query, mark))
+		row := styleLine(line, c.query, mark)
+		if c.wrap && c.vp.Width > 0 {
+			// reflow's wordwrap inside lipgloss is ANSI-aware, so styled rows
+			// fold without losing their colours. A wrapped row still counts as
+			// one viewport row; the buffer caps keep the cost bounded.
+			row = lipgloss.NewStyle().Width(c.vp.Width).Render(row)
+		}
+		rows = append(rows, row)
 	}
 	c.rows, c.hits = rows, hits
 	c.dirty = true
@@ -399,6 +410,13 @@ func (c *ContainerView) HandleEscape() bool {
 // sessionKeys while it does, or digits and X would switch sessions mid-query.
 func (c *ContainerView) Searching() bool { return c.searching }
 
+// TakeWrapToggle reports and clears the wrap-mode change latch.
+func (c *ContainerView) TakeWrapToggle() (wrap, changed bool) {
+	changed = c.wrapToggled
+	c.wrapToggled = false
+	return c.wrap, changed
+}
+
 func (c *ContainerView) SetSize(w, h int) {
 	c.width, c.height = w, h
 	c.vp.Width = max(w-6, 20)
@@ -440,6 +458,11 @@ func (c *ContainerView) Update(msg tea.Msg) (*ContainerView, tea.Cmd) {
 			return c, c.in.Focus()
 		case "m":
 			c.toggleMode()
+			return c, nil
+		case "w":
+			c.wrap = !c.wrap
+			c.wrapToggled = true
+			c.rebuildRows()
 			return c, nil
 		case "n":
 			c.jump(1)
@@ -507,18 +530,28 @@ func (c *ContainerView) header() string {
 }
 
 func (c *ContainerView) help() string {
+	return helpBar(c.helpRows(), 5)
+}
+
+// helpRows is the log view's full key table, resolved by input state.
+func (c *ContainerView) helpRows() []keyHelp {
 	if c.searching {
-		return helpLine("type", "filter", "enter", "apply", "esc", "cancel")
+		return []keyHelp{{"type", "filter"}, {"enter", "apply"}, {"esc", "cancel"}}
 	}
 	if c.query != "" {
 		want := "highlight"
 		if !c.hide {
 			want = "hide"
 		}
-		return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "edit",
-			"m", want, "n/N", "jump", "esc", "clear")
+		return []keyHelp{
+			{"j/k", "scroll"}, {"g/G", "top/bottom"}, {"/", "edit"},
+			{"m", want}, {"n/N", "jump"}, {"w", "wrap"}, {"esc", "clear"},
+		}
 	}
-	return helpLine("j/k", "scroll", "g/G", "top/bottom", "/", "filter", "E", "export", "esc", "back")
+	return []keyHelp{
+		{"j/k", "scroll"}, {"g/G", "top/bottom"}, {"/", "filter"},
+		{"m", "mode"}, {"n/N", "jump"}, {"w", "wrap"}, {"E", "export"}, {"esc", "back"},
+	}
 }
 
 // styleLine renders one raw log line: docker's timestamp dimmed to HH:MM:SS,

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"vpstui/internal/app"
 	"vpstui/internal/config"
 	"vpstui/internal/httpapi"
+	"vpstui/internal/secret"
 	"vpstui/internal/shell"
 )
 
@@ -29,6 +31,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	hubURL := hubFlag(os.Args[1:])
+
 	hosts, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning:", err)
@@ -37,8 +41,25 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "warning:", err)
 	}
-	m := app.New(hosts, tags)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	cfg, err := config.LoadSettings()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+	// Resolution order env > file > default: the env-backed settings only land
+	// in the environment when the user has not set the variable themselves.
+	config.EnvDefaults(cfg)
+	m := app.NewWithSettings(hosts, tags, cfg)
+	if hubURL != "" {
+		// Hub mode: connect now when a token is stored for this URL, else let
+		// the hub form ask for one (the URL stays prefilled).
+		tok, _ := secret.Get(app.HubTokenRef(hubURL))
+		m.SetStartHub(hubURL, tok)
+	}
+	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithContext(ctx)}
+	if cfg.MouseEnabled() {
+		opts = append(opts, tea.WithMouseAllMotion())
+	}
+	p := tea.NewProgram(m, opts...)
 	m.Attach(p.Send)
 
 	srv, ln := startAPI(m.HTTPStore())
@@ -60,6 +81,21 @@ func main() {
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}
+}
+
+// hubFlag extracts --hub <url> / --hub=<url> from the raw args. Everything
+// else is left to the settings/env readers, so new flags never come through
+// two parsers.
+func hubFlag(args []string) string {
+	for i := range args {
+		switch {
+		case args[i] == "--hub" && i+1 < len(args):
+			return strings.TrimSpace(args[i+1])
+		case strings.HasPrefix(args[i], "--hub="):
+			return strings.TrimSpace(strings.TrimPrefix(args[i], "--hub="))
+		}
+	}
+	return ""
 }
 
 // startAPI binds the loopback JSON API and serves it in the background. The

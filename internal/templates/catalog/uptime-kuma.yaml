@@ -1,0 +1,10 @@
+id: uptime-kuma
+name: Uptime Kuma
+description: Self-hosted uptime monitoring with status pages and alerting.
+category: monitoring
+logo: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/uptime-kuma.png
+type: image
+image: louislam/uptime-kuma:1
+port: 3001
+volumes:
+  - "{{id}}-data:/app/data"
