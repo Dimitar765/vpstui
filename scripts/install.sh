@@ -175,7 +175,7 @@ download_release() {
   log "downloading vpstui-server ${VERSION} for linux/${ARCH}"
   curl -fsSL -o "${TMPDIR_DL}/checksums.txt" "${base}/checksums.txt" \
     || die "download failed: checksums.txt (does release ${VERSION} exist?)"
-  curl -fsSL -o "${TMPDIR_DL}/asset.tar.gz" "${base}/${asset}" \
+  curl -fsSL -o "${TMPDIR_DL}/${asset}" "${base}/${asset}" \
     || die "download failed: ${asset} (does release ${VERSION} include linux/${ARCH}?)"
 
   # checksums.txt lists "../<asset>" (sha256sum ran inside dist/); strip the
@@ -184,7 +184,7 @@ download_release() {
   ( cd "$TMPDIR_DL" \
       && grep -F "${asset}" checksums.txt | sed -e 's#\.\./##' | sha256sum -c - ) \
     || die "checksum verification failed for ${asset}"
-  tar -xzf "${TMPDIR_DL}/asset.tar.gz" -C "$TMPDIR_DL"
+  tar -xzf "${TMPDIR_DL}/${asset}" -C "$TMPDIR_DL"
   [[ -f "${TMPDIR_DL}/vpstui-server" ]] || die "archive did not contain the vpstui-server binary"
 }
 
@@ -412,7 +412,7 @@ prep_key() {
 
 register_server() {
   local srv_name
-  srv_name=$(hostname)
+  srv_name=$(uname -n)
 
   api_get /api/servers "$BEARER"
   if [[ $API_STATUS == 200 ]] \
@@ -470,7 +470,10 @@ vps_prep() {
 print_summary() {
   local host_ip
   host_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-  [[ -n ${host_ip:-} ]] || host_ip=$(hostname)
+  if [[ -z ${host_ip:-} ]] && command -v ip >/dev/null 2>&1; then
+    host_ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
+  fi
+  [[ -n ${host_ip:-} ]] || host_ip="<vps-ip>"
 
   local reg_line key_line mode_line
   if (( CONFIGURED )); then
