@@ -128,6 +128,44 @@ all-time peaks, `esc` to close. Its rows re-rank every sample, so the cursor sta
 on the container it was placed on rather than on a row number. (`p`/`P` mean prune
 only inside the disk panel, which `i` opens.)
 
+### Install on a VPS
+
+On any systemd Linux box (amd64 or arm64), as root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dimitar765/vpstui/main/scripts/install.sh | bash
+```
+
+This installs the `vpstui-server` binary from
+[GitHub Releases](https://github.com/Dimitar765/vpstui/releases), creates a
+`vpstui` system user, writes and starts the systemd unit (bound to
+`127.0.0.1:8713` only), bootstraps an admin account plus a one-time API key,
+and — by default — prepares the machine to host deployments: installs docker
+with compose, ensures sshd is running, and registers the machine itself as
+the first managed server (`root@127.0.0.1` via a loopback-restricted SSH key).
+
+The daemon never listens publicly. From your own machine, open a tunnel and
+point the browser at the local port:
+
+```sh
+ssh -N -L 8713:127.0.0.1:8713 root@<vps-ip>
+# then visit http://127.0.0.1:8713/
+```
+
+Flags (passed to `bash -s --`, e.g. `curl ... | bash -s -- --no-docker`):
+
+- `--no-docker` — daemon only: no docker install, no ssh key, no
+  self-registration.
+- `--version <tag>` — install a specific release instead of the latest.
+- `--acme-email <addr>` — bake an ACME account email into the unit for TLS
+  (`--acme-email ''` disables, the default).
+- `--admin-email` / `--admin-password` — override the generated credentials
+  (default email `admin@vpstui.local`, password random 16 hex chars).
+- `--port <port>` — local listen port (default `8713`).
+
+Re-running the script upgrades the binary and unit in place and leaves data,
+admin account and registered servers untouched.
+
 ## Managing this machine
 
 vpstui has one transport: it dials an SSH server and runs `docker`, `awk` and

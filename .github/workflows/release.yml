@@ -1,0 +1,57 @@
+# Release builder: on a v* tag push, build the embedded web GUI, then
+# cross-compile the server daemon and the TUI for linux amd64/arm64 and
+# publish them plus a checksums file to the GitHub release.
+#
+# Asset names are load-bearing: scripts/install.sh downloads exactly
+# vpstui-server_linux_<arch>.tar.gz and checksums.txt.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build embedded web GUI
+        run: make web
+
+      - name: Cross-compile and package linux binaries
+        run: |
+          set -euo pipefail
+          for a in amd64 arm64; do
+            mkdir -p "dist/vpstui-server_linux_$a" "dist/vpstui_linux_$a"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$a" go build -trimpath -ldflags "-s -w" \
+              -o "dist/vpstui-server_linux_$a/vpstui-server" ./cmd/vpstui-server
+            CGO_ENABLED=0 GOOS=linux GOARCH="$a" go build -trimpath -ldflags "-s -w" \
+              -o "dist/vpstui_linux_$a/vpstui" .
+            tar -C "dist/vpstui-server_linux_$a" -czf "vpstui-server_linux_$a.tar.gz" vpstui-server
+            tar -C "dist/vpstui_linux_$a" -czf "vpstui_linux_$a.tar.gz" vpstui
+          done
+          cd dist && sha256sum ../*.tar.gz > ../checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vpstui-server_linux_*.tar.gz
+            vpstui_linux_*.tar.gz
+            checksums.txt
