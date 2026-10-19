@@ -21,6 +21,7 @@ DOWNLOAD_BASE="https://github.com/${REPO}/releases/download"
 LATEST_API="https://api.github.com/repos/${REPO}/releases/latest"
 
 VERSION=""                       # empty = resolve latest
+BIN_SRC=""                       # non-empty = install this local binary (dev)
 WITH_DOCKER=1
 ADMIN_EMAIL="admin@vpstui.local"
 ADMIN_PASSWORD=""                # empty = generated
@@ -48,6 +49,8 @@ usage() {
 Usage: install.sh [options]
 
   --version <tag>        release tag to install (default: latest release)
+  --bin <path>           install this local vpstui-server binary instead of
+                         downloading a release (dev)
   --no-docker            skip VPS prep entirely (no docker, no ssh key, no
                          self-registration); daemon only
   --admin-email <addr>   admin email (default: ${ADMIN_EMAIL})
@@ -70,6 +73,9 @@ parse_args() {
       --version)
         [[ $# -ge 2 ]] || die "--version requires a tag argument"
         VERSION=$2; shift 2 ;;
+      --bin)
+        [[ $# -ge 2 ]] || die "--bin requires a path"
+        BIN_SRC=$2; shift 2 ;;
       --no-docker)
         WITH_DOCKER=0; shift ;;
       --admin-email)
@@ -159,6 +165,17 @@ preflight() {
 # ------------------------------------------------------- download + verify
 
 download_release() {
+  if [[ -n $BIN_SRC ]]; then
+    [[ -f $BIN_SRC ]] || die "--bin file not found: ${BIN_SRC}"
+    TMPDIR_DL=$(mktemp -d)
+    API_BODY_FILE="${TMPDIR_DL}/api-body.json"
+    trap 'rm -rf "$TMPDIR_DL"' EXIT
+    install -m 0755 "$BIN_SRC" "${TMPDIR_DL}/vpstui-server"
+    VERSION=local
+    log "using local binary: ${BIN_SRC}"
+    return 0
+  fi
+
   if [[ -z $VERSION ]]; then
     log "resolving latest release"
     VERSION=$(curl -fsSL "$LATEST_API" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*: *"//;s/"$//') \
@@ -341,7 +358,9 @@ prep_docker() {
     curl -fsSL https://get.docker.com | sh \
       || die "docker install failed — install docker manually and re-run this script"
   fi
-  if ! systemctl enable --now docker >/dev/null 2>&1; then
+  if docker info >/dev/null 2>&1; then
+    log "docker daemon already reachable — skipping service management"
+  elif ! systemctl enable --now docker >/dev/null 2>&1; then
     systemctl start docker >/dev/null 2>&1 || die "could not start the docker service"
   fi
   if ! docker compose version >/dev/null 2>&1; then

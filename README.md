@@ -178,6 +178,7 @@ Flags (passed to `bash -s --`, e.g. `curl ... | bash -s -- --no-docker`):
 - `--no-docker` — daemon only: no docker install, no ssh key, no
   self-registration.
 - `--version <tag>` — install a specific release instead of the latest.
+- `--bin <path>` — install a local vpstui-server binary instead of a release (dev).
 - `--acme-email <addr>` — bake an ACME account email into the unit for TLS
   (`--acme-email ''` disables, the default).
 - `--admin-email` / `--admin-password` — override the generated credentials
