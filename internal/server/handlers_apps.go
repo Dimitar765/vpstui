@@ -13,6 +13,7 @@ import (
 	"vpstui/internal/apitypes"
 	"vpstui/internal/models"
 	"vpstui/internal/store"
+	"vpstui/internal/templates"
 )
 
 // registerApps: projects, environments and the app registry + deploy actions.
@@ -98,6 +99,30 @@ func (req *appReq) row() store.App {
 		Status:        apitypes.AppUndeployed,
 		UpdatedAt:     time.Now().UTC(),
 	}
+}
+
+// resolveTemplate fills a template app's SourceConfig/Port/EnvVars from the
+// catalog so the deploy engine has image/compose_yaml. EnvVars are only
+// seeded when the request carries none.
+func (req *appReq) resolveTemplate() error {
+	id, _ := req.SourceConfig["template_id"].(string)
+	if id == "" {
+		return errors.New("sourceType template requires sourceConfig.template_id")
+	}
+	tpl, err := templates.Get(id)
+	if errors.Is(err, store.ErrNotFound) {
+		return errors.New("template not found")
+	}
+	if err != nil {
+		return err
+	}
+	app := tpl.App(req.ServerID, req.EnvironmentID, req.Name, req.Domains)
+	req.SourceConfig = app.SourceConfig
+	req.Port = tpl.Port // template's port is load-bearing for proxy routing
+	if len(req.EnvVars) == 0 {
+		req.EnvVars = app.EnvVars
+	}
+	return nil
 }
 
 func toAppResp(a store.App) apitypes.App {
@@ -262,6 +287,12 @@ func (s *Server) handleAppCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.SourceType == "template" {
+		if err := req.resolveTemplate(); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	if _, err := s.db.EnvironmentByID(req.EnvironmentID); err != nil {
 		writeErr(w, http.StatusBadRequest, "environment not found")
 		return
@@ -310,6 +341,12 @@ func (s *Server) handleAppUpdate(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad JSON body")
 		return
+	}
+	if req.SourceType == "template" {
+		if err := req.resolveTemplate(); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	// PUT replaces the mutable fields; identity fields stay pinned. Source
 	// config must be present to be replaced (a name-only rename should not
